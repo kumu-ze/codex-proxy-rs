@@ -34,7 +34,18 @@ export interface TicketAccount {
   policy: TicketPolicy
   models: { model: string, ready: boolean, expiresAt: number | null, lastResult: TicketResult | null, busy: boolean, retryAt: number | null, manualRetryAt: number | null }[]
 }
-export interface TicketPanel { revision: number, settings: TicketSettings, proxyConfigured: boolean, proxyCount: number, accounts: TicketAccount[] }
+export interface TicketLog {
+  id: string
+  accountName: string
+  trigger: TicketMode
+  proxyEndpoint: string
+  targetLength: number
+  startedAt: number
+  durationMs: number
+  retryAt: number | null
+  result: TicketResult
+}
+export interface TicketPanel { revision: number, settings: TicketSettings, proxyConfigured: boolean, proxyCount: number, accounts: TicketAccount[], logs: TicketLog[], logLimit: number }
 
 export function getTicketPanel(options: RequestOptions = {}) {
   return request<TicketPanel>({

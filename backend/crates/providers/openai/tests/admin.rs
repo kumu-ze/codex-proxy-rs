@@ -259,6 +259,9 @@ async fn ticket_429_never_creates_a_ticket_and_stops_immediate_retries() {
         .find(|a| a.id == "acct_ticket_a")
         .unwrap();
     assert!(!account.models.iter().any(|m| m.ready));
+    assert_eq!(panel.logs.len(), 1);
+    assert_eq!(panel.logs[0].result.http_status, 429);
+    assert!(panel.logs[0].retry_at.is_some());
     assert!(account.models.iter().all(|m| m.retry_at.is_some()));
     assert!(
         admin
@@ -476,7 +479,12 @@ async fn ticket_pool_rotates_and_manual_zero_keeps_automatic_cooldown() {
             revision: panel.revision,
             settings: panel.settings,
             proxy_url: None,
-            proxy_pool: Some(vec![first.uri(), second.uri()]),
+            proxy_pool: Some(vec![
+                first
+                    .uri()
+                    .replacen("http://", "http://log-user:log-password@", 1),
+                second.uri(),
+            ]),
         })
         .await
         .unwrap();
@@ -514,8 +522,15 @@ async fn ticket_pool_rotates_and_manual_zero_keeps_automatic_cooldown() {
     assert!(model.retry_at.is_some());
     assert!(model.manual_retry_at.is_none());
     let redacted = serde_json::to_string(&panel).unwrap();
-    assert!(!redacted.contains(&first.uri()));
-    assert!(!redacted.contains(&second.uri()));
+    assert!(!redacted.contains("log-user"));
+    assert!(!redacted.contains("log-password"));
+    assert_eq!(panel.logs.len(), 3);
+    assert_eq!(panel.logs[0].proxy_endpoint, first.uri());
+    assert_eq!(panel.logs[1].proxy_endpoint, second.uri());
+    assert_eq!(panel.logs[2].proxy_endpoint, first.uri());
+    assert_eq!(panel.logs[0].trigger, TicketMode::Manual);
+    assert_eq!(panel.logs[0].target_length, 292);
+    assert!(!panel.logs[0].result.matched);
     let restored = provider_openai::initialize(
         config.config.clone(),
         provider_ports_with(store, Arc::new(TestOAuthPending::default())),
@@ -530,6 +545,16 @@ async fn ticket_pool_rotates_and_manual_zero_keeps_automatic_cooldown() {
             .unwrap()
             .proxy_count,
         2
+    );
+    assert_eq!(
+        restored
+            .admin_provider()
+            .ticket_panel()
+            .await
+            .unwrap()
+            .logs
+            .len(),
+        3
     );
     let mut settings = panel.settings;
     settings.manual_interval_seconds = 60;
@@ -608,6 +633,53 @@ async fn ticket_pool_validation_and_clear_preserve_previous_state_on_error() {
         .unwrap();
     assert_eq!(panel.proxy_count, 0);
     assert!(!panel.proxy_configured);
+}
+
+#[tokio::test]
+async fn ticket_failed_connection_is_logged_without_credentials() {
+    let (_config, _store, _server, bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let mut panel = admin.ticket_panel().await.unwrap();
+    panel.settings.enabled = true;
+    panel.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: None,
+            proxy_pool: Some(vec![format!(
+                "http://secret-user:secret-password@127.0.0.1:{port}"
+            )]),
+        })
+        .await
+        .unwrap();
+    let result = admin
+        .probe_ticket(TicketProbe {
+            account_id: "acct_ticket_a".into(),
+            model: "gpt-6-astra".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.http_status, 0);
+    let panel = admin.ticket_panel().await.unwrap();
+    assert_eq!(panel.logs.len(), 1);
+    assert!(panel.logs[0].retry_at.is_some());
+    let json = serde_json::to_string(&panel).unwrap();
+    assert!(!json.contains("secret-user"));
+    assert!(!json.contains("secret-password"));
+    assert_eq!(
+        panel.logs[0].proxy_endpoint,
+        format!("http://127.0.0.1:{port}")
+    );
 }
 
 const COMPLETED_SESSION_SSE: &str = concat!(

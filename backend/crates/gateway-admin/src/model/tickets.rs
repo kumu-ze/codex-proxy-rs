@@ -100,7 +100,7 @@ impl TicketSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TicketResult {
     pub account_id: String,
@@ -110,6 +110,20 @@ pub struct TicketResult {
     pub matched: bool,
     pub checked_at: u64,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketLog {
+    pub id: String,
+    pub account_name: String,
+    pub trigger: TicketMode,
+    pub proxy_endpoint: String,
+    pub target_length: usize,
+    pub started_at: u64,
+    pub duration_ms: u64,
+    pub retry_at: Option<u64>,
+    pub result: TicketResult,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,6 +158,8 @@ pub struct TicketPanel {
     pub proxy_configured: bool,
     pub proxy_count: usize,
     pub accounts: Vec<TicketAccountStatus>,
+    pub logs: Vec<TicketLog>,
+    pub log_limit: usize,
 }
 
 // 不派生 Debug，避免代理认证进入日志；None 保留，空串清除。

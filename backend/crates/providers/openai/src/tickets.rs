@@ -20,11 +20,12 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 const HEADER: &str = "x-codex-turn-state";
+const LOG_LIMIT: usize = 1000;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Ticket {
@@ -44,6 +45,8 @@ struct Persisted {
     #[serde(default)]
     proxy_pool: Vec<String>,
     tickets: Vec<Ticket>,
+    #[serde(default)]
+    logs: Vec<TicketLog>,
 }
 
 impl Default for Persisted {
@@ -54,6 +57,7 @@ impl Default for Persisted {
             proxy_url: String::new(),
             proxy_pool: Vec::new(),
             tickets: Vec::new(),
+            logs: Vec::new(),
         }
     }
 }
@@ -142,13 +146,30 @@ impl TicketService {
                 && valid_state(&t.state, t.state.len())
                 && t.state.len() <= 4096
         });
+        if data.logs.len() > LOG_LIMIT {
+            data.logs.drain(..data.logs.len() - LOG_LIMIT);
+        }
+        let mut observations = Observations::default();
+        for log in &data.logs {
+            observations.last.insert(
+                (log.result.account_id.clone(), log.result.model.clone()),
+                log.result.clone(),
+            );
+            if let Some(retry_at) = log.retry_at.filter(|time| *time > now()) {
+                observations
+                    .retry
+                    .entry(log.result.account_id.clone())
+                    .and_modify(|time| *time = (*time).max(retry_at))
+                    .or_insert(retry_at);
+            }
+        }
         Ok(Self {
             repository,
             profile,
             url: endpoint_url(base_url, CODEX_RESPONSES_PATH),
             path,
             data: Mutex::new(data),
-            observations: Mutex::new(Observations::default()),
+            observations: Mutex::new(observations),
             persistence: AsyncMutex::new(()),
             request_slot: Semaphore::new(1),
         })
@@ -234,6 +255,8 @@ impl TicketService {
             proxy_configured: !d.proxy_pool.is_empty(),
             proxy_count: d.proxy_pool.len(),
             accounts: rows,
+            logs: d.logs.iter().rev().cloned().collect(),
+            log_limit: LOG_LIMIT,
         })
     }
 
@@ -438,21 +461,22 @@ impl TicketService {
             observations.proxy_cursor = observations.proxy_cursor.wrapping_add(1);
             snapshot.proxy_pool[index].clone()
         };
+        let started_at = now();
+        let started = Instant::now();
         let outcome = self.send(&account, &input.model, &proxy).await;
         let (status, state, retry, message) =
-            outcome.unwrap_or_else(|_| (0, String::new(), 60, "请求失败或超时".into()));
-        let current = self
-            .repository
-            .store()
-            .get_account(&account_id)
-            .await
-            .map_err(|_| error(ProviderAdminErrorKind::Unavailable))?;
-        let account_unchanged = current.as_ref().is_some_and(|a| {
-            eligible(a)
-                && a.revision() == account.revision()
-                && a.upstream_account_id() == account.upstream_account_id()
-                && a.plan_type() == account.plan_type()
-        });
+            outcome.unwrap_or_else(|message| (0, String::new(), 60, message.into()));
+        let current = self.repository.store().get_account(&account_id).await;
+        let account_unchanged = current
+            .as_ref()
+            .ok()
+            .and_then(|a| a.as_ref())
+            .is_some_and(|a| {
+                eligible(a)
+                    && a.revision() == account.revision()
+                    && a.upstream_account_id() == account.upstream_account_id()
+                    && a.plan_type() == account.plan_type()
+            });
         let mut matched = status == 200 && valid_state(&state, target) && account_unchanged;
         let guard = self.persistence.lock().await;
         let mut next = self
@@ -471,7 +495,7 @@ impl TicketService {
             matched,
             checked_at: now(),
             message: if next.revision != snapshot.revision || !account_unchanged {
-                "策略或账号已改变，结果未采纳".into()
+                "策略或账号已改变，或账号状态无法复核，结果未采纳".into()
             } else if matched {
                 "已匹配目标规则".into()
             } else {
@@ -490,23 +514,46 @@ impl TicketService {
                 state,
                 expires_at: now() + snapshot.settings.ttl_seconds,
             });
-            self.commit(next).await?;
         }
-        drop(guard);
-        let mut o = self
-            .observations
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let delay = match status {
             429 => retry.max(60),
             401 | 403 => 900,
             0 => 60,
             _ => 0,
         };
-        o.retry
-            .insert(input.account_id.clone(), now().saturating_add(delay));
+        let retry_at = result.checked_at.saturating_add(delay);
+        next.logs.push(TicketLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            account_name: account.name().into(),
+            trigger: if automatic {
+                TicketMode::Auto
+            } else {
+                TicketMode::Manual
+            },
+            proxy_endpoint: proxy_endpoint(&proxy),
+            target_length: target,
+            started_at,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            retry_at: (delay > 0).then_some(retry_at),
+            result: result.clone(),
+        });
+        if next.logs.len() > LOG_LIMIT {
+            next.logs.drain(..next.logs.len() - LOG_LIMIT);
+        }
+        // 失败也落盘；不保存票原文、代理认证或上游正文。
+        let committed = self.commit(next).await;
+        drop(guard);
+        let mut o = self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        o.retry.insert(input.account_id.clone(), retry_at);
         o.last
             .insert((input.account_id, input.model), result.clone());
+        committed.map_err(|_| {
+            error(ProviderAdminErrorKind::Internal)
+                .with_public_message("探测已执行，但日志或票保存失败，请检查磁盘状态")
+        })?;
         Ok(result)
     }
 
@@ -515,13 +562,16 @@ impl TicketService {
         account: &ProviderAccount,
         model: &str,
         proxy: &str,
-    ) -> Result<(u16, String, u64, String), ()> {
+    ) -> Result<(u16, String, u64, String), &'static str> {
         let credential = self
             .repository
             .load_runtime_credential(account)
             .await
-            .map_err(|_| ())?;
-        let auth = credential.authentication.oauth().ok_or(())?;
+            .map_err(|_| "账号凭据读取失败")?;
+        let auth = credential
+            .authentication
+            .oauth()
+            .ok_or("账号没有 OAuth 凭据")?;
         let builder = reqwest::Client::builder()
             .no_proxy()
             .http1_only()
@@ -529,9 +579,9 @@ impl TicketService {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(25))
-            .proxy(reqwest::Proxy::all(proxy).map_err(|_| ())?);
-        let client =
-            crate::transport::tls::build_reqwest_client_with_custom_ca(builder).map_err(|_| ())?;
+            .proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理配置无效")?);
+        let client = crate::transport::tls::build_reqwest_client_with_custom_ca(builder)
+            .map_err(|_| "请求客户端初始化失败")?;
         let profile = self.profile.snapshot();
         // 复用 RS 已核验画像；仅在 Astra 最低版本约束下提升版本，避免身份字段不一致。
         let mut version = profile.codex_version.clone();
@@ -553,7 +603,15 @@ impl TicketService {
         if let Some(id) = account.upstream_account_id() {
             request = request.header("chatgpt-account-id", id);
         }
-        let response = request.send().await.map_err(|_| ())?;
+        let response = request.send().await.map_err(|err| {
+            if err.is_timeout() {
+                "请求超时"
+            } else if err.is_connect() {
+                "代理连接或 TLS 握手失败"
+            } else {
+                "网络请求失败"
+            }
+        })?;
         let status = response.status().as_u16();
         let state = response
             .headers()
@@ -577,17 +635,35 @@ impl TicketService {
                 })
             });
         // 仅取响应头；不消费生成正文，不复用此连接。
-        Ok((
-            status,
-            state,
-            retry,
-            if status == 429 {
-                "上游限流，已退避"
-            } else {
-                "未匹配目标规则"
-            }
-            .into(),
-        ))
+        let message = if status == 429 {
+            "上游限流，已退避"
+        } else if status == 401 || status == 403 {
+            "上游拒绝认证或访问，已退避"
+        } else if status != 200 {
+            "上游返回非 200 状态"
+        } else if state.is_empty() {
+            "响应未包含 Turn-State"
+        } else {
+            "未匹配目标规则"
+        };
+        Ok((status, state, retry, message.into()))
+    }
+}
+
+fn proxy_endpoint(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
+        return "未知代理".into();
+    };
+    // 只组合白名单字段，不在 URL 原文上做字符串脱敏。
+    let host = url
+        .host()
+        .map_or_else(|| "未知主机".into(), |host| host.to_string());
+    let port = url
+        .port_or_known_default()
+        .or_else(|| matches!(url.scheme(), "socks5" | "socks5h").then_some(1080));
+    match port {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
     }
 }
 

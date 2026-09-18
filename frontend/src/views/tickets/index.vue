@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import type { TicketAccount, TicketMode, TicketPanel, TicketPolicy, TicketSettings } from '@/api/modules/tickets'
+import { ChevronLeft, ChevronRight } from '@lucide/vue'
 import { useIntervalFn } from '@vueuse/core'
-import { computed, onMounted, ref, toRaw } from 'vue'
+import { computed, onMounted, ref, toRaw, watch } from 'vue'
 import { getTicketPanel, probeTicket, saveTicketSettings } from '@/api/modules/tickets'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
@@ -23,6 +24,32 @@ const probing = ref('')
 const proxy = ref('')
 const clearProxy = ref(false)
 const search = ref('')
+const logSearch = ref('')
+const logOutcome = ref('all')
+const logPage = ref(1)
+const logOptions = [{ label: '全部结果', value: 'all' }, { label: '已命中', value: 'matched' }, { label: '未命中 / 失败', value: 'failed' }]
+const filteredLogs = computed(() => (panel.value?.logs ?? []).filter((log) => {
+  const text = `${log.accountName} ${log.result.accountId} ${log.result.model} ${log.proxyEndpoint} ${log.result.httpStatus} ${log.result.message}`.toLowerCase()
+  return text.includes(logSearch.value.toLowerCase()) && (logOutcome.value === 'all' || log.result.matched === (logOutcome.value === 'matched'))
+}))
+const logPages = computed(() => Math.max(1, Math.ceil(filteredLogs.value.length / 25)))
+const visibleLogs = computed(() => filteredLogs.value.slice((logPage.value - 1) * 25, logPage.value * 25))
+const proxyStats = computed(() => {
+  const stats = new Map<string, { endpoint: string, count: number, matched: number }>()
+  for (const log of panel.value?.logs ?? []) {
+    const item = stats.get(log.proxyEndpoint) ?? { endpoint: log.proxyEndpoint, count: 0, matched: 0 }
+    item.count++
+    item.matched += Number(log.result.matched)
+    stats.set(item.endpoint, item)
+  }
+  return [...stats.values()].sort((a, b) => b.matched - a.matched || b.count - a.count)
+})
+watch([logSearch, logOutcome], () => {
+  logPage.value = 1
+})
+watch(logPages, (pages) => {
+  logPage.value = Math.min(logPage.value, pages)
+})
 const failure = ref('')
 const models = ref('')
 const policies = ref<Record<string, TicketPolicy>>({})
@@ -249,6 +276,120 @@ useIntervalFn(async () => {
           </article>
         </div>
       </BaseCard>
+      <section aria-labelledby="ticket-log-title" class="min-w-0">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <h2 id="ticket-log-title" class="text-xl font-semibold">
+            打标日志
+          </h2>
+          <span class="text-sm text-cp-text-secondary">最近 {{ panel.logs?.length ?? 0 }} / {{ panel.logLimit ?? 1000 }} 条</span>
+        </div>
+        <p class="mt-2 text-sm text-cp-text-secondary">
+          代理地址不等于真实出口 IP；动态代理的出口 IP 未确认。日志从本次升级后开始记录。
+        </p>
+        <div v-if="proxyStats.length" class="mt-4 overflow-x-auto">
+          <table class="w-full text-left text-sm">
+            <thead>
+              <tr>
+                <th class="p-2">
+                  代理地址
+                </th><th class="p-2">
+                  次数
+                </th><th class="p-2">
+                  命中
+                </th><th class="p-2">
+                  命中率
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="item in proxyStats" :key="item.endpoint">
+                <td class="break-all p-2 font-mono">
+                  {{ item.endpoint }}
+                </td><td class="p-2">
+                  {{ item.count }}
+                </td><td class="p-2">
+                  {{ item.matched }}
+                </td><td class="p-2">
+                  {{ (100 * item.matched / item.count).toFixed(1) }}%
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="my-4 flex flex-wrap gap-3">
+          <BaseInput v-model="logSearch" aria-label="搜索打标日志" placeholder="账号、模型、代理 IP 或状态" class="w-full sm:w-80" />
+          <BaseSelect v-model="logOutcome" :options="logOptions" aria-label="打标日志结果筛选" class="w-44" />
+        </div>
+        <p v-if="!visibleLogs.length" class="py-6 text-cp-text-secondary">
+          暂无匹配的打标记录
+        </p>
+        <div v-else class="overflow-x-auto">
+          <table class="w-full min-w-[960px] text-left text-sm">
+            <thead>
+              <tr>
+                <th class="p-3">
+                  时间 / 触发
+                </th><th class="p-3">
+                  账号 / 模型
+                </th><th class="p-3">
+                  代理地址
+                </th><th class="p-3">
+                  HTTP / 长度
+                </th><th class="p-3">
+                  结果 / 耗时
+                </th><th class="p-3">
+                  详情
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="log in visibleLogs" :key="log.id" class="odd:bg-cp-fill-quaternary">
+                <td class="p-3 align-top">
+                  {{ time(log.startedAt) }}<div class="mt-1 text-cp-text-secondary">
+                    {{ log.trigger === 'auto' ? '自动' : '手动' }}
+                  </div>
+                </td>
+                <td class="max-w-56 break-all p-3 align-top">
+                  {{ log.accountName }}<div class="mt-1 font-mono text-xs">
+                    {{ log.result.accountId }}
+                  </div><div class="mt-1 font-mono text-xs">
+                    {{ log.result.model }}
+                  </div>
+                </td>
+                <td class="max-w-64 break-all p-3 align-top font-mono text-xs">
+                  {{ log.proxyEndpoint }}
+                </td>
+                <td class="p-3 align-top">
+                  {{ log.result.httpStatus || '无响应' }}<div class="mt-1">
+                    {{ log.result.length }} / {{ log.targetLength }}
+                  </div>
+                </td>
+                <td class="p-3 align-top">
+                  <span :class="log.result.matched ? 'text-cp-success-text' : 'text-cp-warning-text'">{{ log.result.matched ? '已命中' : '未命中' }}</span><div class="mt-1">
+                    {{ log.durationMs }} ms
+                  </div>
+                </td>
+                <td class="max-w-80 break-words p-3 align-top">
+                  {{ log.result.message }}<div v-if="log.retryAt" class="mt-1 text-xs">
+                    退避至 {{ time(log.retryAt) }}
+                  </div><div class="mt-1 break-all font-mono text-xs text-cp-text-tertiary">
+                    {{ log.id }}
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="mt-4 flex items-center justify-end gap-3">
+          <span class="text-sm text-cp-text-secondary">{{ filteredLogs.length }} 条 · {{ logPage }} / {{ logPages }}</span>
+          <BaseButton aria-label="上一页日志" title="上一页日志" :disabled="logPage <= 1" @click="logPage--">
+            <ChevronLeft :size="16" />
+          </BaseButton>
+          <BaseButton aria-label="下一页日志" title="下一页日志" :disabled="logPage >= logPages" @click="logPage++">
+            <ChevronRight :size="16" />
+          </BaseButton>
+        </div>
+      </section>
     </template>
   </div>
 </template>
