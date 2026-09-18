@@ -106,6 +106,7 @@ use execution::*;
 pub use failure::openai_failure_affects_account_score;
 use failure::*;
 use observation::*;
+pub(crate) use workers::ticket_worker;
 pub(crate) use workers::worker_contributions;
 
 const PROVIDER_NAME: &str = "openai";
@@ -138,6 +139,7 @@ pub enum CodexProviderConfigError {
 }
 
 pub struct CodexProvider {
+    tickets: Option<Arc<crate::tickets::TicketService>>,
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
     quota: Arc<CodexCredentialQuotaService>,
@@ -192,6 +194,7 @@ impl CodexProvider {
         let client =
             CodexBackendClient::new(http, base_url, profile).with_websocket_pool(websocket_pool);
         Ok(Self {
+            tickets: None,
             selector,
             catalog,
             quota,
@@ -209,6 +212,11 @@ impl CodexProvider {
 
     pub(crate) fn with_session_identity(mut self, identity: CodexSessionIdentity) -> Self {
         self.session_identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn with_tickets(mut self, tickets: Arc<crate::tickets::TicketService>) -> Self {
+        self.tickets = Some(tickets);
         self
     }
 }
@@ -549,6 +557,14 @@ impl Provider for CodexProvider {
             lease.installation_id(),
             account_scope,
         );
+        // 先清理客户端跨账号状态，再注入当前账号/模型的管理票，防止被身份清理抹掉。
+        if let Some(state) = self
+            .tickets
+            .as_ref()
+            .and_then(|s| s.get(lease.account(), upstream_model.as_str()))
+        {
+            upstream_request.turn_state = Some(state);
+        }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = lease
             .account()

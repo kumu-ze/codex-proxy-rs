@@ -110,6 +110,24 @@ impl ProviderAdminError {
 /// 全部由 [`crate::ports::store::AccountStore`] 提交。运行时资源通知只在事务成功后发生。
 #[async_trait]
 pub trait ProviderAdmin: Send + Sync {
+    async fn ticket_panel(&self) -> Result<crate::model::tickets::TicketPanel, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    async fn update_tickets(
+        &self,
+        _update: crate::model::tickets::TicketUpdate,
+    ) -> Result<crate::model::tickets::TicketPanel, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    async fn probe_ticket(
+        &self,
+        _probe: crate::model::tickets::TicketProbe,
+    ) -> Result<crate::model::tickets::TicketResult, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     /// 只读内置价目；没有本地计价能力的 Provider 返回空目录。
     fn pricing_catalog(&self) -> crate::model::pricing::ProviderPricingCatalog {
         Default::default()

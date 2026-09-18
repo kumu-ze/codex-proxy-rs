@@ -59,6 +59,396 @@ use crate::support::{
     account_policy, profile, secret,
 };
 
+use gateway_admin::model::tickets::{TicketAccountPolicy, TicketMode, TicketProbe, TicketUpdate};
+
+async fn setup() -> (
+    TestOpenAiConfig,
+    Arc<MemoryAccountStore>,
+    MockServer,
+    provider_openai::ProviderBundle,
+) {
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in ["acct_ticket_a", "acct_ticket_b"] {
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: id.into(),
+                name: id.into(),
+                secret: secret("ticket-test-only"),
+                verified_account: profile(&format!("chatgpt-{id}")),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+    }
+    let server = MockServer::start().await;
+    let mut config = valid_config();
+    config.config.api.base_url = server.uri();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    (config, store, server, bundle)
+}
+
+#[tokio::test]
+async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
+    let (config, store, server, bundle) = setup().await;
+    // HTTP 目标使本地 mock 代理能直接检查请求，不依赖公网。
+    let admin = bundle.admin_provider();
+    let panel = admin.ticket_panel().await.unwrap();
+    assert!(!panel.settings.enabled);
+    let mut settings = panel.settings;
+    settings.enabled = true;
+    settings.inject = true;
+    settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    let updated = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: settings.clone(),
+            proxy_url: Some(server.uri()),
+        })
+        .await
+        .unwrap();
+    let ticket = format!("gAAAAA{}", "a".repeat(286));
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer ticket-test-only",
+        ))
+        .and(wiremock::matchers::header("connection", "close"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-codex-turn-state", ticket.as_str()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let outcome = admin
+        .probe_ticket(TicketProbe {
+            account_id: "acct_ticket_a".into(),
+            model: "gpt-6-astra".into(),
+        })
+        .await
+        .unwrap();
+    assert!(outcome.matched);
+    let body = serde_json::to_string(&admin.ticket_panel().await.unwrap()).unwrap();
+    assert!(!body.contains(&ticket));
+    assert!(!body.contains("ticket-test-only"));
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_b".into(),
+                model: "gpt-6-astra".into()
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-5.6-sol".into()
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        admin
+            .update_tickets(TicketUpdate {
+                revision: 1,
+                settings: settings.clone(),
+                proxy_url: None
+            })
+            .await
+            .is_err()
+    );
+    let restored = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let panel = restored.admin_provider().ticket_panel().await.unwrap();
+    assert!(
+        panel
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .ready
+    );
+    assert!(
+        !panel
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_b")
+            .unwrap()
+            .models[0]
+            .ready
+    );
+    settings.accounts.get_mut("acct_ticket_a").unwrap().mode = TicketMode::Off;
+    let disabled = admin
+        .update_tickets(TicketUpdate {
+            revision: updated.revision,
+            settings,
+            proxy_url: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !disabled
+            .accounts
+            .iter()
+            .any(|a| a.models.iter().any(|m| m.ready))
+    );
+}
+
+#[tokio::test]
+async fn ticket_429_never_creates_a_ticket_and_stops_immediate_retries() {
+    let (_config, _store, server, bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let mut panel = admin.ticket_panel().await.unwrap();
+    panel.settings.enabled = true;
+    panel.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Auto,
+            target_length: Some(332),
+        },
+    );
+    admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: Some(server.uri()),
+        })
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = admin
+        .probe_ticket(TicketProbe {
+            account_id: "acct_ticket_a".into(),
+            model: "gpt-5.6-sol".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.http_status, 429);
+    assert!(!result.matched);
+    let panel = admin.ticket_panel().await.unwrap();
+    let account = panel
+        .accounts
+        .iter()
+        .find(|a| a.id == "acct_ticket_a")
+        .unwrap();
+    assert!(!account.models.iter().any(|m| m.ready));
+    assert!(account.models.iter().all(|m| m.retry_at.is_some()));
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-6-astra".into()
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
+    let (_config, _store, server, bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let mut panel = admin.ticket_panel().await.unwrap();
+    panel.settings.enabled = true;
+    panel.settings.inject = true;
+    panel.settings.models = vec!["gpt-5.4".into()];
+    panel.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(332),
+        },
+    );
+    let updated = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: Some(server.uri()),
+        })
+        .await
+        .unwrap();
+    let ticket = format!("gAAAAA{}", "b".repeat(326));
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-codex-turn-state", ticket.as_str()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-5.4".into()
+            })
+            .await
+            .unwrap()
+            .matched
+    );
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(COMPLETED_SESSION_SSE),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    for (index, id) in ["acct_ticket_a", "acct_ticket_b", "acct_ticket_a"]
+        .into_iter()
+        .enumerate()
+    {
+        if index == 2 {
+            let mut settings = updated.settings.clone();
+            settings.accounts.get_mut(id).unwrap().mode = TicketMode::Off;
+            admin
+                .update_tickets(TicketUpdate {
+                    revision: updated.revision,
+                    settings,
+                    proxy_url: None,
+                })
+                .await
+                .unwrap();
+        }
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.4","input":"hello"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".into(), json!(false))]));
+        let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
+        let mut stream = bundle
+            .core_provider()
+            .execute(
+                initialized_provider_request(operation, id),
+                initialized_attempt_context(&format!("req_ticket_{index}"), id),
+            )
+            .await
+            .unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].headers.get("x-codex-turn-state").unwrap(),
+        ticket.as_str()
+    );
+    assert!(!requests[1].headers.contains_key("x-codex-turn-state"));
+    assert!(!requests[2].headers.contains_key("x-codex-turn-state"));
+}
+
+#[tokio::test]
+async fn ticket_worker_only_probes_auto_accounts_and_rejects_wrong_length() {
+    let (_config, _store, server, mut bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let mut panel = admin.ticket_panel().await.unwrap();
+    panel.settings.enabled = true;
+    panel.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    panel.settings.accounts.insert(
+        "acct_ticket_b".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Auto,
+            target_length: Some(292),
+        },
+    );
+    admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: Some(server.uri()),
+        })
+        .await
+        .unwrap();
+    let wrong_length = format!("gAAAAA{}", "a".repeat(306));
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::header(
+            "chatgpt-account-id",
+            "chatgpt-acct_ticket_b",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-codex-turn-state", wrong_length.as_str()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let registration = bundle
+        .take_worker_contributions()
+        .into_iter()
+        .find_map(|c| match c {
+            WorkerContribution::Registration(r) if r.id.owner() == "openai-turn-state-tickets" => {
+                Some(r)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let context = gateway_core::task::WorkerCycleContext::new(
+        registration.id,
+        None,
+        CancellationToken::new(),
+    );
+    let WorkerRunnable::Scheduled { task, .. } = registration.runnable else {
+        panic!("scheduled task")
+    };
+    task.run_cycle(context.clone()).await.unwrap();
+    task.run_cycle(context).await.unwrap();
+    let panel = admin.ticket_panel().await.unwrap();
+    assert!(
+        panel
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models
+            .iter()
+            .all(|m| m.last_result.is_none())
+    );
+    let tested = panel
+        .accounts
+        .iter()
+        .find(|a| a.id == "acct_ticket_b")
+        .unwrap()
+        .models
+        .iter()
+        .find_map(|m| m.last_result.as_ref())
+        .unwrap();
+    assert_eq!(tested.length, 312);
+    assert!(!tested.matched);
+}
+
 const COMPLETED_SESSION_SSE: &str = concat!(
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_initialized_session\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
@@ -74,7 +464,7 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     assert_eq!(bundle.core_provider().name(), "openai");
     assert_eq!(bundle.admin_provider().provider_kind().as_str(), "openai");
     let contributions = bundle.take_worker_contributions();
-    assert_eq!(contributions.len(), 7);
+    assert_eq!(contributions.len(), 8);
     assert!(
         contributions
             .iter()

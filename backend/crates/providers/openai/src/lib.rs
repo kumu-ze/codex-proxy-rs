@@ -4,6 +4,7 @@ mod admin;
 pub mod config;
 mod provider;
 mod session_transport;
+mod tickets;
 
 use std::sync::Arc;
 
@@ -126,6 +127,15 @@ pub async fn initialize(
     );
     platform_releases.restore().await;
     let repository = CodexCredentialRepository::new(Arc::clone(&accounts));
+    let tickets = Arc::new(
+        tickets::TicketService::new(
+            repository.clone(),
+            profile.clone(),
+            config.base_url(),
+            config.ticket_path(),
+        )
+        .map_err(|_| OpenAiInitializeError::Transport)?,
+    );
     let websocket_pool = Arc::new(CodexWebSocketPool::with_config(
         config.websocket_pool_config(),
     ));
@@ -174,7 +184,8 @@ pub async fn initialize(
             config.stream_max_retries(),
         )
         .map_err(OpenAiInitializeError::Provider)?
-        .with_session_identity(session_identity),
+        .with_session_identity(session_identity)
+        .with_tickets(Arc::clone(&tickets)),
     );
     let token_client = Arc::new(
         credential::token_client::openai_token_client(
@@ -214,21 +225,24 @@ pub async fn initialize(
         )
         .with_oauth_client_id(config.oauth_client_id()),
     );
-    let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(OpenAiAdminProvider::new(
-        provider_kind,
-        profile,
-        accounts,
-        OpenAiAdminServices {
-            credentials: credential_admin,
-            oauth: oauth_admin,
-            profile_statistics,
-            quota: Arc::clone(&quota),
-            catalog: Arc::clone(&catalog),
-        },
-        websocket_pool,
-        desktop_release_status,
-    ));
-    let worker_contributions = provider::worker_contributions(
+    let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(
+        OpenAiAdminProvider::new(
+            provider_kind,
+            profile,
+            accounts,
+            OpenAiAdminServices {
+                credentials: credential_admin,
+                oauth: oauth_admin,
+                profile_statistics,
+                quota: Arc::clone(&quota),
+                catalog: Arc::clone(&catalog),
+            },
+            websocket_pool,
+            desktop_release_status,
+        )
+        .with_tickets(Arc::clone(&tickets)),
+    );
+    let mut worker_contributions = provider::worker_contributions(
         refresh,
         quota,
         catalog,
@@ -241,6 +255,8 @@ pub async fn initialize(
         },
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
+    worker_contributions
+        .push(provider::ticket_worker(tickets).map_err(|_| OpenAiInitializeError::Worker)?);
 
     Ok(ProviderBundle {
         core_provider,

@@ -5,6 +5,9 @@
 
 # Codex Proxy RS
 
+本 fork 增加独立的 [打标管理面板](docs/ticket-management.md)：按账号关闭、手动或自动探测，
+支持 Plus/Pro、Business 套餐默认长度与账号自定义规则。功能默认关闭。
+
 面向 Codex 的自托管多账号 AI 网关
 
 [![CI](https://github.com/zyycn/codex-proxy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/zyycn/codex-proxy-rs/actions/workflows/ci.yml)

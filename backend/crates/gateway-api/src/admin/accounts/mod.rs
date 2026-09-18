@@ -68,6 +68,7 @@ mod credentials;
 mod handlers;
 mod import_tasks;
 mod presenter;
+mod tickets;
 mod wire;
 
 pub use credentials::*;

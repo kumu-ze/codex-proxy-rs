@@ -73,6 +73,7 @@ const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
 
 /// OpenAI 对终态 Admin port 的唯一实现。
 pub(crate) struct OpenAiAdminProvider {
+    tickets: Option<Arc<crate::tickets::TicketService>>,
     provider_kind: ProviderKind,
     profile: CodexWireProfileState,
     accounts: Arc<dyn ProviderAccountStore>,
@@ -104,6 +105,7 @@ impl OpenAiAdminProvider {
         desktop_release: CodexDesktopReleaseStatus,
     ) -> Self {
         Self {
+            tickets: None,
             provider_kind,
             profile,
             accounts,
@@ -127,6 +129,11 @@ impl OpenAiAdminProvider {
             .map_err(map_store_error)?
             .filter(|account| account.provider() == &self.provider_kind)
             .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::NotFound))
+    }
+
+    pub(crate) fn with_tickets(mut self, tickets: Arc<crate::tickets::TicketService>) -> Self {
+        self.tickets = Some(tickets);
+        self
     }
 
     async fn preserve_existing_installation_id(
@@ -163,6 +170,35 @@ impl OpenAiAdminProvider {
 
 #[async_trait]
 impl ProviderAdmin for OpenAiAdminProvider {
+    async fn ticket_panel(
+        &self,
+    ) -> Result<gateway_admin::model::tickets::TicketPanel, ProviderAdminError> {
+        self.tickets
+            .as_ref()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unsupported))?
+            .panel()
+            .await
+    }
+    async fn update_tickets(
+        &self,
+        update: gateway_admin::model::tickets::TicketUpdate,
+    ) -> Result<gateway_admin::model::tickets::TicketPanel, ProviderAdminError> {
+        self.tickets
+            .as_ref()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unsupported))?
+            .update(update)
+            .await
+    }
+    async fn probe_ticket(
+        &self,
+        probe: gateway_admin::model::tickets::TicketProbe,
+    ) -> Result<gateway_admin::model::tickets::TicketResult, ProviderAdminError> {
+        self.tickets
+            .as_ref()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unsupported))?
+            .probe(probe)
+            .await
+    }
     fn pricing_catalog(&self) -> gateway_admin::model::pricing::ProviderPricingCatalog {
         crate::transport::usage::pricing_catalog()
     }

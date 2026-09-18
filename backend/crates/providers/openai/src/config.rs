@@ -47,6 +47,10 @@ pub struct OpenAiConfig {
 }
 
 impl OpenAiConfig {
+    pub(crate) fn ticket_path(&self) -> PathBuf {
+        self.identity_secret_path
+            .with_file_name("turn-state-tickets.json")
+    }
     /// 校验 Provider-owned 字段，并从统一运行数据目录定位会话身份密钥。
     pub fn resolve_and_validate(
         &mut self,

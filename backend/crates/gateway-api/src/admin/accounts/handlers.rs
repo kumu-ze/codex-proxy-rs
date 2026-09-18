@@ -10,6 +10,7 @@ where
     S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .merge(super::tickets::router::<S>())
         .merge(super::import_tasks::router::<S>())
         .route("/api/admin/accounts", get(list_accounts::<S>))
         .route("/api/admin/accounts/detail", get(account_detail::<S>))

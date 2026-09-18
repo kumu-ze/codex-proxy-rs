@@ -47,6 +47,23 @@ const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
 /// 统一账号页消费的服务。
 #[async_trait]
 pub trait AccountsService: Send + Sync {
+    async fn ticket_panel(&self) -> Result<crate::model::tickets::TicketPanel, AdminError> {
+        Err(AdminError::invalid("当前版本不支持打标管理"))
+    }
+    async fn update_tickets(
+        &self,
+        _context: &MutationContext,
+        _update: crate::model::tickets::TicketUpdate,
+    ) -> Result<crate::model::tickets::TicketPanel, AdminError> {
+        Err(AdminError::invalid("当前版本不支持打标管理"))
+    }
+    async fn probe_ticket(
+        &self,
+        _context: &MutationContext,
+        _probe: crate::model::tickets::TicketProbe,
+    ) -> Result<crate::model::tickets::TicketResult, AdminError> {
+        Err(AdminError::invalid("当前版本不支持打标管理"))
+    }
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError>;
 
     async fn export(
@@ -654,6 +671,50 @@ impl AccountsService for DefaultAccountsService {
         }
         publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
         Ok(result)
+    }
+
+    async fn ticket_panel(&self) -> Result<crate::model::tickets::TicketPanel, AdminError> {
+        let kind =
+            ProviderKind::new("openai").map_err(|_| AdminError::internal("Provider 无效"))?;
+        self.providers
+            .require(&kind)
+            .map_err(|e| map_provider_error(e, "ticket provider"))?
+            .ticket_panel()
+            .await
+            .map_err(|e| map_provider_error(e, "ticket panel"))
+    }
+
+    async fn update_tickets(
+        &self,
+        context: &MutationContext,
+        update: crate::model::tickets::TicketUpdate,
+    ) -> Result<crate::model::tickets::TicketPanel, AdminError> {
+        let kind =
+            ProviderKind::new("openai").map_err(|_| AdminError::internal("Provider 无效"))?;
+        let result = self
+            .providers
+            .require(&kind)
+            .map_err(|e| map_provider_error(e, "ticket provider"))?
+            .update_tickets(update)
+            .await
+            .map_err(|e| map_provider_error(e, "ticket update"))?;
+        tracing::info!(actor = ?context.actor, request_id = %context.request_id, revision = result.revision, "打标策略已更新");
+        Ok(result)
+    }
+
+    async fn probe_ticket(
+        &self,
+        context: &MutationContext,
+        probe: crate::model::tickets::TicketProbe,
+    ) -> Result<crate::model::tickets::TicketResult, AdminError> {
+        let id = ProviderAccountId::new(probe.account_id.clone())
+            .map_err(|_| AdminError::invalid("账号无效"))?;
+        let (_, provider) = self.provider_for_account(&id).await?;
+        tracing::info!(actor = ?context.actor, request_id = %context.request_id, account_id = %probe.account_id, "管理员触发单次打标");
+        provider
+            .probe_ticket(probe)
+            .await
+            .map_err(|e| map_provider_error(e, "ticket probe"))
     }
 
     async fn account_configuration(

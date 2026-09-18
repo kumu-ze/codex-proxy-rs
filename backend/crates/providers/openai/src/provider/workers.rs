@@ -10,6 +10,16 @@ pub(crate) struct ClientReleaseServices {
     pub platforms: Arc<PlatformDesktopReleaseService>,
 }
 
+pub(crate) fn ticket_worker(
+    service: Arc<crate::tickets::TicketService>,
+) -> Result<WorkerContribution, WorkerDefinitionError> {
+    Ok(WorkerContribution::Registration(scheduled_registration(
+        WorkerId::try_new(WorkerKind::QuotaCatalogHealth, "openai-turn-state-tickets")?,
+        Duration::from_secs(10),
+        Box::new(crate::tickets::TicketTask(service)),
+    )?))
+}
+
 pub(super) const WORKER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 pub(super) const WORKER_MAXIMUM_BACKOFF: Duration = Duration::from_secs(60);
 pub(super) const WORKER_LEASE_TTL: Duration = Duration::from_secs(15 * 60);

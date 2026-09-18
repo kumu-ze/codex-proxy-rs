@@ -61,6 +61,7 @@ const navItems = [
   { label: '概览', icon: LayoutDashboard, path: '/' },
   { label: '账号管理', icon: Users, path: '/accounts' },
   { label: '代理管理', icon: Network, path: '/proxies' },
+  { label: '打标管理', icon: Network, path: '/tickets' },
   { label: '分组管理', icon: FolderTree, path: '/groups' },
   { label: 'API 密钥', icon: KeyRound, path: '/keys' },
   { label: '使用统计', icon: ChartNoAxesColumn, path: '/usage' },
