@@ -116,6 +116,7 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
             settings: settings.clone(),
             proxy_url: None,
             proxy_pool: Some(vec![server.uri()]),
+            proxies: None,
         })
         .await
         .unwrap();
@@ -169,6 +170,7 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
                 settings: settings.clone(),
                 proxy_url: None,
                 proxy_pool: None,
+                proxies: None,
             })
             .await
             .is_err()
@@ -205,6 +207,7 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
             settings,
             proxy_url: None,
             proxy_pool: None,
+            proxies: None,
         })
         .await
         .unwrap();
@@ -235,6 +238,7 @@ async fn ticket_429_never_creates_a_ticket_and_stops_immediate_retries() {
             settings: panel.settings,
             proxy_url: Some(server.uri()),
             proxy_pool: None,
+            proxies: None,
         })
         .await
         .unwrap();
@@ -295,6 +299,7 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
             settings: panel.settings,
             proxy_url: Some(server.uri()),
             proxy_pool: None,
+            proxies: None,
         })
         .await
         .unwrap();
@@ -340,6 +345,7 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
                     settings,
                     proxy_url: None,
                     proxy_pool: None,
+                    proxies: None,
                 })
                 .await
                 .unwrap();
@@ -401,6 +407,7 @@ async fn ticket_worker_only_probes_auto_accounts_and_rejects_wrong_length() {
             settings: panel.settings,
             proxy_url: Some(server.uri()),
             proxy_pool: None,
+            proxies: None,
         })
         .await
         .unwrap();
@@ -485,6 +492,7 @@ async fn ticket_pool_rotates_and_manual_zero_keeps_automatic_cooldown() {
                     .replacen("http://", "http://log-user:log-password@", 1),
                 second.uri(),
             ]),
+            proxies: None,
         })
         .await
         .unwrap();
@@ -564,6 +572,7 @@ async fn ticket_pool_rotates_and_manual_zero_keeps_automatic_cooldown() {
             settings,
             proxy_url: None,
             proxy_pool: None,
+            proxies: None,
         })
         .await
         .unwrap();
@@ -593,6 +602,7 @@ async fn ticket_pool_validation_and_clear_preserve_previous_state_on_error() {
                 settings: panel.settings.clone(),
                 proxy_url: None,
                 proxy_pool: Some(pool),
+                proxies: None,
             })
             .await
             .unwrap_err();
@@ -608,6 +618,7 @@ async fn ticket_pool_validation_and_clear_preserve_previous_state_on_error() {
             settings,
             proxy_url: None,
             proxy_pool: None,
+            proxies: None,
         })
         .await
         .unwrap_err();
@@ -618,6 +629,7 @@ async fn ticket_pool_validation_and_clear_preserve_previous_state_on_error() {
             settings: panel.settings,
             proxy_url: Some(server.uri()),
             proxy_pool: None,
+            proxies: None,
         })
         .await
         .unwrap();
@@ -628,6 +640,7 @@ async fn ticket_pool_validation_and_clear_preserve_previous_state_on_error() {
             settings: panel.settings,
             proxy_url: None,
             proxy_pool: Some(vec![]),
+            proxies: None,
         })
         .await
         .unwrap();
@@ -659,6 +672,7 @@ async fn ticket_failed_connection_is_logged_without_credentials() {
             proxy_pool: Some(vec![format!(
                 "http://secret-user:secret-password@127.0.0.1:{port}"
             )]),
+            proxies: None,
         })
         .await
         .unwrap();
@@ -680,6 +694,75 @@ async fn ticket_failed_connection_is_logged_without_credentials() {
         panel.logs[0].proxy_endpoint,
         format!("http://127.0.0.1:{port}")
     );
+    let model = &panel
+        .accounts
+        .iter()
+        .find(|a| a.id == "acct_ticket_a")
+        .unwrap()
+        .models[0];
+    assert!(model.manual_retry_at.is_none());
+    assert!(model.retry_at.is_some());
+    assert_eq!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-6-astra".into()
+            })
+            .await
+            .unwrap()
+            .http_status,
+        0
+    );
+}
+
+#[tokio::test]
+async fn ticket_named_pool_preserves_credentials_on_rename_and_reorder() {
+    use gateway_admin::model::tickets::TicketProxyInput;
+    let (_config, _store, server, bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let panel = admin.ticket_panel().await.unwrap();
+    let panel = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: None,
+            proxy_pool: None,
+            proxies: Some(vec![TicketProxyInput {
+                id: None,
+                name: "named".into(),
+                url: Some(
+                    server
+                        .uri()
+                        .replacen("http://", "http://username:password@", 1),
+                ),
+                saved_proxy_id: None,
+            }]),
+        })
+        .await
+        .unwrap();
+    assert!(panel.proxies[0].has_authentication);
+    assert_eq!(panel.proxies[0].endpoint, server.uri());
+    let id = panel.proxies[0].id.clone();
+    let panel = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: None,
+            proxy_pool: None,
+            proxies: Some(vec![TicketProxyInput {
+                id: Some(id),
+                name: "renamed".into(),
+                url: None,
+                saved_proxy_id: None,
+            }]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(panel.proxies[0].name, "renamed");
+    assert!(panel.proxies[0].has_authentication);
+    let json = serde_json::to_string(&panel).unwrap();
+    assert!(!json.contains("username"));
+    assert!(!json.contains("password"));
 }
 
 const COMPLETED_SESSION_SSE: &str = concat!(

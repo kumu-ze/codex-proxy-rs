@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import type { TicketAccount, TicketMode, TicketPanel, TicketPolicy, TicketSettings } from '@/api/modules/tickets'
-import { ChevronLeft, ChevronRight } from '@lucide/vue'
+import type { OutboundProxyRecord } from '@/api/modules/proxies'
+import type { TicketAccount, TicketMode, TicketPanel, TicketPolicy, TicketProxyInput, TicketSettings } from '@/api/modules/tickets'
+import { ChevronLeft, ChevronRight, Plus, Trash2 } from '@lucide/vue'
 import { useIntervalFn } from '@vueuse/core'
 import { computed, onMounted, ref, toRaw, watch } from 'vue'
+import { getProxies } from '@/api/modules/proxies'
 import { getTicketPanel, probeTicket, saveTicketSettings } from '@/api/modules/tickets'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
@@ -23,13 +25,46 @@ const saving = ref(false)
 const probing = ref('')
 const proxy = ref('')
 const clearProxy = ref(false)
+const poolDraft = ref<(TicketProxyInput & { key: number, endpoint: string, hasAuthentication: boolean })[]>([])
+let proxyKey = 0
+const savedProxies = ref<OutboundProxyRecord[]>([])
+const selectedProxy = ref('')
+const importing = ref(false)
+const savedProxyOptions = computed(() => savedProxies.value.map(p => ({ value: p.id, label: `${p.name} · ${p.endpoint}` })))
+function addProxy() {
+  poolDraft.value.push({ key: ++proxyKey, name: `代理 ${poolDraft.value.length + 1}`, url: '', endpoint: '', hasAuthentication: false })
+}
+async function loadSavedProxies() {
+  importing.value = true
+  try {
+    const items: OutboundProxyRecord[] = []
+    for (let page = 1; ; page++) {
+      const result = await getProxies({ page, pageSize: 100 })
+      items.push(...result.items)
+      if (page >= result.page.totalPages)
+        break
+    }
+    savedProxies.value = items
+    if (!items.length)
+      toast.warning('RS 代理管理中暂无已保存代理')
+  }
+  catch {}
+  finally { importing.value = false }
+}
+function importProxy() {
+  const item = savedProxies.value.find(p => p.id === selectedProxy.value)
+  if (!item)
+    return
+  poolDraft.value.push({ key: ++proxyKey, name: item.name, savedProxyId: item.id, endpoint: item.endpoint, hasAuthentication: item.hasAuthentication })
+  selectedProxy.value = ''
+}
 const search = ref('')
 const logSearch = ref('')
 const logOutcome = ref('all')
 const logPage = ref(1)
 const logOptions = [{ label: '全部结果', value: 'all' }, { label: '已命中', value: 'matched' }, { label: '未命中 / 失败', value: 'failed' }]
 const filteredLogs = computed(() => (panel.value?.logs ?? []).filter((log) => {
-  const text = `${log.accountName} ${log.result.accountId} ${log.result.model} ${log.proxyEndpoint} ${log.result.httpStatus} ${log.result.message}`.toLowerCase()
+  const text = `${log.accountName} ${log.result.accountId} ${log.result.model} ${log.proxyName ?? ''} ${log.proxyEndpoint} ${log.result.httpStatus} ${log.result.message}`.toLowerCase()
   return text.includes(logSearch.value.toLowerCase()) && (logOutcome.value === 'all' || log.result.matched === (logOutcome.value === 'matched'))
 }))
 const logPages = computed(() => Math.max(1, Math.ceil(filteredLogs.value.length / 25)))
@@ -72,6 +107,7 @@ function accept(data: TicketPanel) {
   policies.value = Object.fromEntries(data.accounts.map(a => [a.id, { ...a.policy }]))
   customLengths.value = Object.fromEntries(data.accounts.map(a => [a.id, a.policy.targetLength?.toString() ?? '']))
   proxy.value = ''
+  poolDraft.value = (data.proxies ?? []).map(p => ({ ...p, key: ++proxyKey, url: '' }))
   clearProxy.value = false
 }
 async function load() {
@@ -119,18 +155,24 @@ async function save() {
     return
   }
   const proxyPool = proxy.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean)
-  if (!clearProxy.value && proxyPool.length > 64) {
+  const proxies: TicketProxyInput[] = poolDraft.value.map(p => ({ id: p.id, name: p.name.trim(), url: p.url?.trim() || undefined, savedProxyId: p.savedProxyId }))
+  proxies.push(...proxyPool.map((url, i) => ({ name: `代理 ${poolDraft.value.length + i + 1}`, url })))
+  if (!clearProxy.value && proxies.length > 64) {
     toast.warning('代理池最多 64 个代理')
     return
   }
-  if (settings.enabled && (clearProxy.value || (!proxyPool.length && !panel.value.proxyConfigured))) {
+  if (!clearProxy.value && proxies.some(p => !p.name || (!p.id && !p.savedProxyId && !p.url))) {
+    toast.warning('请填写代理名称和新代理完整地址')
+    return
+  }
+  if (settings.enabled && (clearProxy.value || !proxies.length)) {
     toast.warning('启用打标需要配置代理池；清除代理池前请关闭打标')
     return
   }
   saving.value = true
   generation += 1
   try {
-    accept(await saveTicketSettings({ revision: draftRevision.value, settings, proxyPool: clearProxy.value ? [] : proxyPool.length ? proxyPool : undefined }))
+    accept(await saveTicketSettings({ revision: draftRevision.value, settings, proxies: clearProxy.value ? [] : proxies }))
     toast.success('策略已保存，旧票已失效；后续按新规则打标')
   }
   catch {}
@@ -222,8 +264,32 @@ useIntervalFn(async () => {
             <span>目标模型（逗号分隔）</span><BaseInput id="ticket-models" v-model="models" aria-label="目标模型（逗号分隔）" />
           </div>
           <label class="flex flex-col gap-2" for="ticket-proxy">
-            <span>专用打标代理池 · {{ panel.proxyConfigured ? `已配置 ${panel.proxyCount ?? 1} 个，留空保留` : '尚未配置' }}</span><textarea id="ticket-proxy" v-model="proxy" aria-label="专用打标代理池" autocomplete="off" spellcheck="false" placeholder="每行一个代理" class="min-h-24 rounded-lg bg-cp-fill-tertiary p-3 font-mono text-sm" :disabled="clearProxy" />
+            <span>批量追加代理</span><textarea id="ticket-proxy" v-model="proxy" aria-label="批量追加代理" autocomplete="off" spellcheck="false" placeholder="每行一个完整代理地址" class="min-h-24 rounded-lg bg-cp-fill-tertiary p-3 font-mono text-sm" :disabled="clearProxy" />
           </label>
+        </div>
+        <div class="mt-4 flex flex-wrap items-center gap-3">
+          <h3 class="font-semibold">
+            已保存 {{ panel.proxyCount }} 个代理
+          </h3>
+          <BaseButton :disabled="clearProxy || poolDraft.length >= 64" title="新增代理" aria-label="新增代理" @click="addProxy">
+            <Plus :size="16" />
+          </BaseButton>
+          <BaseButton :disabled="importing" @click="loadSavedProxies">
+            {{ importing ? '读取中…' : '读取 RS 已有代理' }}
+          </BaseButton>
+          <BaseSelect v-if="savedProxies.length" v-model="selectedProxy" :options="savedProxyOptions" aria-label="选择已有代理" class="w-full sm:w-80" />
+          <BaseButton v-if="savedProxies.length" :disabled="!selectedProxy || clearProxy" @click="importProxy">
+            加入打标池
+          </BaseButton>
+        </div>
+        <div v-for="entry in poolDraft" :key="entry.key" class="mt-3 flex flex-wrap items-center gap-3">
+          <BaseInput v-model="entry.name" aria-label="代理名称" class="w-full sm:w-44" :disabled="clearProxy" />
+          <span class="min-w-0 flex-1 break-all font-mono text-sm">{{ entry.endpoint || '新代理' }} · {{ entry.hasAuthentication ? '已保存认证' : '无已保存认证' }}</span>
+          <BaseInput v-if="!entry.savedProxyId" v-model="entry.url" :aria-label="`${entry.name} 代理地址`" type="password" autocomplete="new-password" :placeholder="entry.id !== undefined ? '留空保留地址及认证；输入完整 URL 替换' : 'socks5://用户名:密码@主机:端口'" class="w-full sm:w-80" :disabled="clearProxy" />
+          <span v-else class="text-sm text-cp-text-secondary">保存时导入认证</span>
+          <BaseButton :aria-label="`移除 ${entry.name}`" title="移除代理" :disabled="clearProxy" @click="poolDraft = poolDraft.filter(p => p.key !== entry.key)">
+            <Trash2 :size="16" />
+          </BaseButton>
         </div>
         <div class="mt-4">
           <BaseSwitch v-model="clearProxy" label="清除已保存的代理（需同时关闭打标）" show-label />
@@ -357,6 +423,9 @@ useIntervalFn(async () => {
                   </div>
                 </td>
                 <td class="max-w-64 break-all p-3 align-top font-mono text-xs">
+                  <div v-if="log.proxyName" class="mb-1 font-sans">
+                    {{ log.proxyName }}
+                  </div>
                   {{ log.proxyEndpoint }}
                 </td>
                 <td class="p-3 align-top">
@@ -371,7 +440,7 @@ useIntervalFn(async () => {
                 </td>
                 <td class="max-w-80 break-words p-3 align-top">
                   {{ log.result.message }}<div v-if="log.retryAt" class="mt-1 text-xs">
-                    退避至 {{ time(log.retryAt) }}
+                    自动退避至 {{ time(log.retryAt) }}
                   </div><div class="mt-1 break-all font-mono text-xs text-cp-text-tertiary">
                     {{ log.id }}
                   </div>

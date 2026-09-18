@@ -9,10 +9,14 @@
 填写专用打标代理池（每行一个 HTTP/HTTPS/SOCKS5 代理），选择账号模式后保存策略。后台和手动探测按轮换顺序使用代理池；自动探测与普通业务分别使用
 专用代理和账号原有出口；专用代理不可用时不会回退直连。
 
-代理池最多 64 个，留空保留，面板只展示数量。自动探测间隔为 10–86400 秒，
+代理池最多 64 个，已有条目的 URL 留空保留认证。自动探测间隔为 10–86400 秒，
 手动探测间隔为 0–86400 秒，默认 0（上一请求结束后可再次点击）。
 两者按账号共享最近探测时间，但分别计算等待期限；修改间隔后立即按新值计算。
-手动 0 秒仍遵守 429、401/403 和网络失败退避，以及单请求并发限制。
+手动 0 秒在网络失败后可立即重试，仍遵守 429、401/403 退避和单请求并发限制。
+网络失败后的 60 秒退避仅用于自动任务。
+代理池显示名称、脱敏地址和认证是否保存；修改名称时保留认证。支持单条添加、移除、
+批量追加，以及从 RS 代理管理导入（服务端复制认证，浏览器不读取密码）。导入是快照，
+以后修改原代理需重新导入。完整 URL 输入留空时按条目 ID 和策略 revision 保留原值。
 
 | 账号模式 | 后台探测 | 手动按钮 | 有效票注入 |
 | --- | --- | --- | --- |
@@ -72,7 +76,7 @@ Linux 上新文件权限为 0600。文件包含代理认证和票材料，应按
 ## 管理接口
 
 - `GET /api/admin/tickets`：设置 revision、非敏感策略、OAuth 账号、各模型最近结果、到期与退避时间。
-- `POST /api/admin/tickets`：提交 `{revision, settings, proxyUrl?, proxyPool?}`。代理字段二选一，省略保留，空池清除。`settings.manualIntervalSeconds` 省略时为 0。
+- `POST /api/admin/tickets`：提交 `{revision, settings, proxies?, proxyUrl?, proxyPool?}`。代理字段只选一个，省略保留，空池清除。`proxies` 条目为 `{id?, name, url?, savedProxyId?}`，已有条目省略 URL 保留认证，导入使用 `savedProxyId`。`settings.manualIntervalSeconds` 省略时为 0。
 - `POST /api/admin/tickets/probe`：提交 `{accountId, model}`，单次探测并返回状态摘要。
 
 响应沿用 RS `{code, message, data}` 信封。探测匹配与否是 `data.matched`，不是管理接口

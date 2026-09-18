@@ -165,6 +165,7 @@ pub trait AccountsService: Send + Sync {
 }
 
 pub(crate) struct DefaultAccountsService {
+    proxies: Arc<dyn crate::ports::proxy::ProxyStore>,
     accounts: Arc<dyn AccountStore>,
     account_runtime: Arc<dyn AccountRuntimeStore>,
     providers: ProviderAdminRegistry,
@@ -182,8 +183,10 @@ impl DefaultAccountsService {
         providers: ProviderAdminRegistry,
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
+        proxies: Arc<dyn crate::ports::proxy::ProxyStore>,
     ) -> Self {
         Self {
+            proxies,
             accounts,
             account_runtime,
             providers,
@@ -687,8 +690,31 @@ impl AccountsService for DefaultAccountsService {
     async fn update_tickets(
         &self,
         context: &MutationContext,
-        update: crate::model::tickets::TicketUpdate,
+        mut update: crate::model::tickets::TicketUpdate,
     ) -> Result<crate::model::tickets::TicketPanel, AdminError> {
+        if let Some(entries) = &mut update.proxies {
+            if entries.len() > 64 {
+                return Err(AdminError::invalid("代理池最多 64 个代理"));
+            }
+            for entry in entries {
+                if let Some(id) = entry.saved_proxy_id.take() {
+                    if entry.id.is_some() || entry.url.is_some() {
+                        return Err(AdminError::invalid(
+                            "导入已有代理不能同时填写 URL 或池内 ID",
+                        ));
+                    }
+                    let record = self
+                        .proxies
+                        .get(&id)
+                        .await
+                        .map_err(|e| map_store_error(e, "ticket proxy import"))?;
+                    if entry.name.trim().is_empty() {
+                        entry.name = record.name;
+                    }
+                    entry.url = Some(record.proxy.expose_url().to_owned());
+                }
+            }
+        }
         let kind =
             ProviderKind::new("openai").map_err(|_| AdminError::internal("Provider 无效"))?;
         let result = self

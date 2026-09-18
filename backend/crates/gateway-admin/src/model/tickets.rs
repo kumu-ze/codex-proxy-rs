@@ -119,6 +119,8 @@ pub struct TicketLog {
     pub account_name: String,
     pub trigger: TicketMode,
     pub proxy_endpoint: String,
+    #[serde(default)]
+    pub proxy_name: String,
     pub target_length: usize,
     pub started_at: u64,
     pub duration_ms: u64,
@@ -157,6 +159,7 @@ pub struct TicketPanel {
     pub settings: TicketSettings,
     pub proxy_configured: bool,
     pub proxy_count: usize,
+    pub proxies: Vec<TicketProxyView>,
     pub accounts: Vec<TicketAccountStatus>,
     pub logs: Vec<TicketLog>,
     pub log_limit: usize,
@@ -171,6 +174,26 @@ pub struct TicketUpdate {
     pub proxy_url: Option<String>,
     #[serde(default)]
     pub proxy_pool: Option<Vec<String>>,
+    pub proxies: Option<Vec<TicketProxyInput>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketProxyView {
+    pub id: String,
+    pub name: String,
+    pub endpoint: String,
+    pub has_authentication: bool,
+}
+
+// URL 只允许写入，不派生 Debug；旧条目凭 revision + id 保留认证。
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TicketProxyInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub url: Option<String>,
+    pub saved_proxy_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

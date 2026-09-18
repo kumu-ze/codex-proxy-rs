@@ -39,13 +39,16 @@ export interface TicketLog {
   accountName: string
   trigger: TicketMode
   proxyEndpoint: string
+  proxyName: string
   targetLength: number
   startedAt: number
   durationMs: number
   retryAt: number | null
   result: TicketResult
 }
-export interface TicketPanel { revision: number, settings: TicketSettings, proxyConfigured: boolean, proxyCount: number, accounts: TicketAccount[], logs: TicketLog[], logLimit: number }
+export interface TicketProxyInput { id?: string, name: string, url?: string, savedProxyId?: string }
+export interface TicketProxyView { id: string, name: string, endpoint: string, hasAuthentication: boolean }
+export interface TicketPanel { revision: number, settings: TicketSettings, proxyConfigured: boolean, proxyCount: number, proxies: TicketProxyView[], accounts: TicketAccount[], logs: TicketLog[], logLimit: number }
 
 export function getTicketPanel(options: RequestOptions = {}) {
   return request<TicketPanel>({
@@ -54,7 +57,7 @@ export function getTicketPanel(options: RequestOptions = {}) {
     ...options,
   })
 }
-export function saveTicketSettings(data: { revision: number, settings: TicketSettings, proxyUrl?: string, proxyPool?: string[] }) {
+export function saveTicketSettings(data: { revision: number, settings: TicketSettings, proxyUrl?: string, proxyPool?: string[], proxies?: TicketProxyInput[] }) {
   return request<TicketPanel>({
     url: '/api/admin/tickets',
     method: 'POST',
