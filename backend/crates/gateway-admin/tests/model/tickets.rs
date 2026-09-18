@@ -5,6 +5,7 @@ fn ticket_plan_defaults_and_explicit_override_are_distinct() {
     let mut settings = TicketSettings::default();
     assert!(!settings.enabled);
     assert!(!settings.inject);
+    assert_eq!(settings.manual_interval_seconds, 0);
     assert_eq!(settings.target_length("acct_a", Some("plus")), 292);
     assert_eq!(settings.target_length("acct_a", Some("pro")), 292);
     assert_eq!(settings.target_length("acct_a", Some("business")), 332);
@@ -27,6 +28,10 @@ fn ticket_settings_reject_unbounded_or_inconsistent_work() {
     for settings in [
         TicketSettings {
             interval_seconds: 0,
+            ..base.clone()
+        },
+        TicketSettings {
+            manual_interval_seconds: 86401,
             ..base.clone()
         },
         TicketSettings {

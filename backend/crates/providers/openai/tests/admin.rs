@@ -102,6 +102,7 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
     let mut settings = panel.settings;
     settings.enabled = true;
     settings.inject = true;
+    settings.manual_interval_seconds = 60;
     settings.accounts.insert(
         "acct_ticket_a".into(),
         TicketAccountPolicy {
@@ -113,7 +114,8 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
         .update_tickets(TicketUpdate {
             revision: panel.revision,
             settings: settings.clone(),
-            proxy_url: Some(server.uri()),
+            proxy_url: None,
+            proxy_pool: Some(vec![server.uri()]),
         })
         .await
         .unwrap();
@@ -165,7 +167,8 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
             .update_tickets(TicketUpdate {
                 revision: 1,
                 settings: settings.clone(),
-                proxy_url: None
+                proxy_url: None,
+                proxy_pool: None,
             })
             .await
             .is_err()
@@ -201,6 +204,7 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
             revision: updated.revision,
             settings,
             proxy_url: None,
+            proxy_pool: None,
         })
         .await
         .unwrap();
@@ -230,6 +234,7 @@ async fn ticket_429_never_creates_a_ticket_and_stops_immediate_retries() {
             revision: panel.revision,
             settings: panel.settings,
             proxy_url: Some(server.uri()),
+            proxy_pool: None,
         })
         .await
         .unwrap();
@@ -286,6 +291,7 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
             revision: panel.revision,
             settings: panel.settings,
             proxy_url: Some(server.uri()),
+            proxy_pool: None,
         })
         .await
         .unwrap();
@@ -330,6 +336,7 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
                     revision: updated.revision,
                     settings,
                     proxy_url: None,
+                    proxy_pool: None,
                 })
                 .await
                 .unwrap();
@@ -390,6 +397,7 @@ async fn ticket_worker_only_probes_auto_accounts_and_rejects_wrong_length() {
             revision: panel.revision,
             settings: panel.settings,
             proxy_url: Some(server.uri()),
+            proxy_pool: None,
         })
         .await
         .unwrap();
@@ -447,6 +455,159 @@ async fn ticket_worker_only_probes_auto_accounts_and_rejects_wrong_length() {
         .unwrap();
     assert_eq!(tested.length, 312);
     assert!(!tested.matched);
+}
+
+#[tokio::test]
+async fn ticket_pool_rotates_and_manual_zero_keeps_automatic_cooldown() {
+    let (config, store, first, bundle) = setup().await;
+    let second = MockServer::start().await;
+    let admin = bundle.admin_provider();
+    let mut panel = admin.ticket_panel().await.unwrap();
+    panel.settings.enabled = true;
+    panel.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Auto,
+            target_length: Some(292),
+        },
+    );
+    panel = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: None,
+            proxy_pool: Some(vec![first.uri(), second.uri()]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(panel.proxy_count, 2);
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&second)
+        .await;
+    for _ in 0..3 {
+        assert_eq!(
+            admin
+                .probe_ticket(TicketProbe {
+                    account_id: "acct_ticket_a".into(),
+                    model: "gpt-6-astra".into()
+                })
+                .await
+                .unwrap()
+                .http_status,
+            200
+        );
+    }
+    let panel = admin.ticket_panel().await.unwrap();
+    let model = &panel
+        .accounts
+        .iter()
+        .find(|a| a.id == "acct_ticket_a")
+        .unwrap()
+        .models[0];
+    assert!(model.retry_at.is_some());
+    assert!(model.manual_retry_at.is_none());
+    let redacted = serde_json::to_string(&panel).unwrap();
+    assert!(!redacted.contains(&first.uri()));
+    assert!(!redacted.contains(&second.uri()));
+    let restored = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored
+            .admin_provider()
+            .ticket_panel()
+            .await
+            .unwrap()
+            .proxy_count,
+        2
+    );
+    let mut settings = panel.settings;
+    settings.manual_interval_seconds = 60;
+    let panel = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings,
+            proxy_url: None,
+            proxy_pool: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(panel.proxy_count, 2);
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-6-astra".into()
+            })
+            .await
+            .is_err()
+    );
+    first.verify().await;
+    second.verify().await;
+}
+
+#[tokio::test]
+async fn ticket_pool_validation_and_clear_preserve_previous_state_on_error() {
+    let (_config, _store, server, bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let panel = admin.ticket_panel().await.unwrap();
+    for pool in [vec!["file:///tmp/secret".into()], vec![server.uri(); 65]] {
+        let err = admin
+            .update_tickets(TicketUpdate {
+                revision: panel.revision,
+                settings: panel.settings.clone(),
+                proxy_url: None,
+                proxy_pool: Some(pool),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ProviderAdminErrorKind::Invalid);
+        assert!(err.public_message().is_some());
+        assert_eq!(admin.ticket_panel().await.unwrap().revision, panel.revision);
+    }
+    let mut settings = panel.settings.clone();
+    settings.interval_seconds = 0;
+    let err = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings,
+            proxy_url: None,
+            proxy_pool: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.public_message().unwrap().contains("10–86400"));
+    let panel = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: Some(server.uri()),
+            proxy_pool: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(panel.proxy_count, 1);
+    let panel = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: None,
+            proxy_pool: Some(vec![]),
+        })
+        .await
+        .unwrap();
+    assert_eq!(panel.proxy_count, 0);
+    assert!(!panel.proxy_configured);
 }
 
 const COMPLETED_SESSION_SSE: &str = concat!(

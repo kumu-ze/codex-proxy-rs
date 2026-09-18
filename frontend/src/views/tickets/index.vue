@@ -40,6 +40,7 @@ function accept(data: TicketPanel) {
   panel.value = data
   draftRevision.value = data.revision
   draft.value = structuredClone(data.settings)
+  draft.value.manualIntervalSeconds ??= 0
   models.value = data.settings.models.join(', ')
   policies.value = Object.fromEntries(data.accounts.map(a => [a.id, { ...a.policy }]))
   customLengths.value = Object.fromEntries(data.accounts.map(a => [a.id, a.policy.targetLength?.toString() ?? '']))
@@ -74,10 +75,35 @@ async function save() {
     toast.warning('目标长度应为 64–4096 的整数')
     return
   }
+  const ranges: [number, number, number, string][] = [
+    [settings.intervalSeconds, 10, 86400, '自动探测间隔应为 10–86400 秒的整数'],
+    [settings.manualIntervalSeconds, 0, 86400, '手动探测间隔应为 0–86400 秒的整数'],
+    [settings.ttlSeconds, 60, 3600, '有效期应为 60–3600 秒的整数'],
+    [settings.refreshBeforeSeconds, 0, settings.ttlSeconds - 1, '提前刷新时间必须为非负整数且小于有效期'],
+  ]
+  for (const [value, min, max, message] of ranges) {
+    if (!Number.isInteger(value) || value < min || value > max) {
+      toast.warning(message)
+      return
+    }
+  }
+  if (!settings.models.length || settings.models.length > 8 || new Set(settings.models).size !== settings.models.length || settings.models.some(model => !/^[\w.-]{1,128}$/.test(model))) {
+    toast.warning('请填写 1–8 个不重复的有效模型名称')
+    return
+  }
+  const proxyPool = proxy.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean)
+  if (!clearProxy.value && proxyPool.length > 64) {
+    toast.warning('代理池最多 64 个代理')
+    return
+  }
+  if (settings.enabled && (clearProxy.value || (!proxyPool.length && !panel.value.proxyConfigured))) {
+    toast.warning('启用打标需要配置代理池；清除代理池前请关闭打标')
+    return
+  }
   saving.value = true
   generation += 1
   try {
-    accept(await saveTicketSettings({ revision: draftRevision.value, settings, proxyUrl: clearProxy.value ? '' : proxy.value.trim() || undefined }))
+    accept(await saveTicketSettings({ revision: draftRevision.value, settings, proxyPool: clearProxy.value ? [] : proxyPool.length ? proxyPool : undefined }))
     toast.success('策略已保存，旧票已失效；后续按新规则打标')
   }
   catch {}
@@ -159,7 +185,8 @@ useIntervalFn(async () => {
           <label class="flex flex-col gap-2" for="ticket-plus">Plus / Pro 默认长度<input id="ticket-plus" v-model.number="draft.plusProLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
           <label class="flex flex-col gap-2" for="ticket-business">Business / Team 默认长度<input id="ticket-business" v-model.number="draft.businessLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
           <label class="flex flex-col gap-2" for="ticket-default">其他套餐默认长度<input id="ticket-default" v-model.number="draft.defaultLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
-          <label class="flex flex-col gap-2" for="ticket-interval">账号最小探测间隔（秒）<input id="ticket-interval" v-model.number="draft.intervalSeconds" type="number" min="10" max="86400" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+          <label class="flex flex-col gap-2" for="ticket-interval">自动探测间隔（秒）<input id="ticket-interval" v-model.number="draft.intervalSeconds" type="number" min="10" max="86400" step="1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+          <label class="flex flex-col gap-2" for="ticket-manual-interval">手动探测间隔（秒，0 为无等待）<input id="ticket-manual-interval" v-model.number="draft.manualIntervalSeconds" type="number" min="0" max="86400" step="1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
           <label class="flex flex-col gap-2" for="ticket-ttl">有效期（秒，最多 3600）<input id="ticket-ttl" v-model.number="draft.ttlSeconds" type="number" min="60" max="3600" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
           <label class="flex flex-col gap-2" for="ticket-refresh">提前刷新（秒）<input id="ticket-refresh" v-model.number="draft.refreshBeforeSeconds" type="number" min="0" :max="draft.ttlSeconds - 1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
         </div>
@@ -167,9 +194,9 @@ useIntervalFn(async () => {
           <div class="flex flex-col gap-2">
             <span>目标模型（逗号分隔）</span><BaseInput id="ticket-models" v-model="models" aria-label="目标模型（逗号分隔）" />
           </div>
-          <div class="flex flex-col gap-2">
-            <span>专用打标代理 · {{ panel.proxyConfigured ? '已配置，留空保留' : '尚未配置' }}</span><BaseInput id="ticket-proxy" v-model="proxy" aria-label="专用打标代理" type="password" autocomplete="new-password" placeholder="http://user:password@host:port" :disabled="clearProxy" />
-          </div>
+          <label class="flex flex-col gap-2" for="ticket-proxy">
+            <span>专用打标代理池 · {{ panel.proxyConfigured ? `已配置 ${panel.proxyCount ?? 1} 个，留空保留` : '尚未配置' }}</span><textarea id="ticket-proxy" v-model="proxy" aria-label="专用打标代理池" autocomplete="off" spellcheck="false" placeholder="每行一个代理" class="min-h-24 rounded-lg bg-cp-fill-tertiary p-3 font-mono text-sm" :disabled="clearProxy" />
+          </label>
         </div>
         <div class="mt-4">
           <BaseSwitch v-model="clearProxy" label="清除已保存的代理（需同时关闭打标）" show-label />
@@ -212,9 +239,9 @@ useIntervalFn(async () => {
                   最近：{{ status.lastResult ? `HTTP ${status.lastResult.httpStatus} / 长度 ${status.lastResult.length}` : '尚未探测' }}
                 </p>
                 <p class="mt-1 text-xs text-cp-text-secondary">
-                  到期：{{ time(status.expiresAt) }}<span v-if="status.retryAt"> · 下次可探测：{{ time(status.retryAt) }}</span>
+                  到期：{{ time(status.expiresAt) }}<span v-if="status.manualRetryAt"> · 下次可手动探测：{{ time(status.manualRetryAt) }}</span>
                 </p>
-                <BaseButton class="mt-3" :disabled="!!probing || saving || !panel.settings.enabled || !panel.proxyConfigured || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.retryAt && status.retryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
+                <BaseButton class="mt-3" :disabled="!!probing || saving || !panel.settings.enabled || !panel.proxyConfigured || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
                   {{ probing === `${account.id}/${status.model}` || status.busy ? '探测中…' : '手动打一张' }}
                 </BaseButton>
               </div>

@@ -39,7 +39,10 @@ struct Ticket {
 struct Persisted {
     revision: u64,
     settings: TicketSettings,
+    #[serde(default)]
     proxy_url: String,
+    #[serde(default)]
+    proxy_pool: Vec<String>,
     tickets: Vec<Ticket>,
 }
 
@@ -49,6 +52,7 @@ impl Default for Persisted {
             revision: 1,
             settings: TicketSettings::default(),
             proxy_url: String::new(),
+            proxy_pool: Vec::new(),
             tickets: Vec::new(),
         }
     }
@@ -59,6 +63,20 @@ struct Observations {
     last: BTreeMap<(String, String), TicketResult>,
     retry: BTreeMap<String, u64>,
     busy: Option<(String, String)>,
+    proxy_cursor: usize,
+}
+
+impl Observations {
+    fn retry_at(&self, id: &str, interval: u64) -> Option<u64> {
+        let ordinary = self
+            .last
+            .iter()
+            .filter(|((account, _), _)| account == id)
+            .map(|(_, result)| result.checked_at.saturating_add(interval))
+            .max()
+            .unwrap_or(0);
+        Some(ordinary.max(self.retry.get(id).copied().unwrap_or(0))).filter(|time| *time > now())
+    }
 }
 
 pub(crate) struct TicketService {
@@ -106,7 +124,16 @@ impl TicketService {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Persisted::default(),
             Err(_) => return Err(error(ProviderAdminErrorKind::Internal)),
         };
-        if !data.settings.validate() || !valid_proxy(&data.proxy_url) {
+        if data.proxy_pool.is_empty() && !data.proxy_url.is_empty() {
+            data.proxy_pool = split_proxy_pool(&data.proxy_url);
+        }
+        if !data.settings.validate()
+            || data.proxy_pool.len() > 64
+            || !data
+                .proxy_pool
+                .iter()
+                .all(|p| !p.is_empty() && valid_proxy(p))
+        {
             return Err(error(ProviderAdminErrorKind::Invalid));
         }
         data.tickets.retain(|t| {
@@ -187,7 +214,8 @@ impl TicketService {
                                 expires_at: ticket.map(|t| t.expires_at),
                                 last_result: o.last.get(&key).cloned(),
                                 busy: o.busy.as_ref() == Some(&key),
-                                retry_at: o.retry.get(id).copied().filter(|t| *t > now()),
+                                retry_at: o.retry_at(id, d.settings.interval_seconds),
+                                manual_retry_at: o.retry_at(id, d.settings.manual_interval_seconds),
                             }
                         })
                         .collect(),
@@ -203,7 +231,8 @@ impl TicketService {
         Ok(TicketPanel {
             revision: d.revision,
             settings,
-            proxy_configured: !d.proxy_url.is_empty(),
+            proxy_configured: !d.proxy_pool.is_empty(),
+            proxy_count: d.proxy_pool.len(),
             accounts: rows,
         })
     }
@@ -212,9 +241,53 @@ impl TicketService {
         &self,
         update: TicketUpdate,
     ) -> Result<TicketPanel, ProviderAdminError> {
-        if !update.settings.validate() || update.proxy_url.as_ref().is_some_and(|p| !valid_proxy(p))
+        if !(10..=86400).contains(&update.settings.interval_seconds) {
+            return Err(error(ProviderAdminErrorKind::Invalid).with_public_message(
+                "自动探测间隔应为 10–86400 秒；手动立即重试请将手动间隔设为 0",
+            ));
+        }
+        if update.settings.manual_interval_seconds > 86400 {
+            return Err(error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("手动探测间隔应为 0–86400 秒"));
+        }
+        if !(60..=3600).contains(&update.settings.ttl_seconds)
+            || update.settings.refresh_before_seconds >= update.settings.ttl_seconds
         {
-            return Err(error(ProviderAdminErrorKind::Invalid));
+            return Err(error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("有效期应为 60–3600 秒，提前刷新时间必须小于有效期"));
+        }
+        if update.proxy_pool.is_some() && update.proxy_url.is_some() {
+            return Err(error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("请只提交代理池或旧版单代理字段之一"));
+        }
+        let requested_pool = update
+            .proxy_pool
+            .as_ref()
+            .map(|pool| {
+                pool.iter()
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .or_else(|| {
+                update
+                    .proxy_url
+                    .as_ref()
+                    .map(|proxy| split_proxy_pool(proxy))
+            });
+        if !update.settings.validate() {
+            return Err(error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("请检查目标长度、模型列表和账号策略；模型不能重复"));
+        }
+        if requested_pool
+            .as_ref()
+            .is_some_and(|pool| pool.len() > 64 || pool.iter().any(|item| !valid_proxy(item)))
+        {
+            return Err(error(ProviderAdminErrorKind::Invalid).with_public_message(
+                "代理池最多 64 个，每行填写一个有效的 HTTP、HTTPS、SOCKS5 或 SOCKS5H 代理地址",
+            ));
         }
         let accounts = self
             .repository
@@ -226,7 +299,8 @@ impl TicketService {
                 .iter()
                 .any(|a| a.id().as_str() == id && a.authentication_kind() == "oauth")
         }) {
-            return Err(error(ProviderAdminErrorKind::Invalid));
+            return Err(error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("账号列表已变化，请刷新页面后重新保存"));
         }
         let guard = self.persistence.lock().await;
         let mut next = self
@@ -242,11 +316,13 @@ impl TicketService {
             .checked_add(1)
             .ok_or_else(|| error(ProviderAdminErrorKind::Conflict))?;
         next.settings = update.settings;
-        if let Some(proxy) = update.proxy_url {
-            next.proxy_url = proxy.trim().into();
+        if let Some(pool) = requested_pool {
+            next.proxy_url = pool.join("\n");
+            next.proxy_pool = pool;
         }
-        if next.settings.enabled && next.proxy_url.is_empty() {
-            return Err(error(ProviderAdminErrorKind::Invalid));
+        if next.settings.enabled && next.proxy_pool.is_empty() {
+            return Err(error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("启用打标需要先配置代理池；清除代理池前请关闭打标"));
         }
         // 策略改变后旧票全部失效，进行中的旧策略探测也不能重新写回。
         next.tickets.clear();
@@ -317,7 +393,7 @@ impl TicketService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if !snapshot.settings.enabled
-            || snapshot.proxy_url.is_empty()
+            || snapshot.proxy_pool.is_empty()
             || !snapshot.settings.models.contains(&input.model)
             || snapshot
                 .settings
@@ -338,8 +414,14 @@ impl TicketService {
                 .observations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if o.retry.get(&input.account_id).is_some_and(|t| *t > now()) {
-                return Err(error(ProviderAdminErrorKind::Conflict));
+            let interval = if automatic {
+                snapshot.settings.interval_seconds
+            } else {
+                snapshot.settings.manual_interval_seconds
+            };
+            if o.retry_at(&input.account_id, interval).is_some() {
+                return Err(error(ProviderAdminErrorKind::Conflict)
+                    .with_public_message("账号仍在探测间隔或上游错误退避中，请稍后重试"));
             }
             o.busy = Some((input.account_id.clone(), input.model.clone()));
         }
@@ -347,7 +429,16 @@ impl TicketService {
         let target = snapshot
             .settings
             .target_length(&input.account_id, account.plan_type());
-        let outcome = self.send(&account, &input.model, &snapshot.proxy_url).await;
+        let proxy = {
+            let mut observations = self
+                .observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let index = observations.proxy_cursor % snapshot.proxy_pool.len();
+            observations.proxy_cursor = observations.proxy_cursor.wrapping_add(1);
+            snapshot.proxy_pool[index].clone()
+        };
+        let outcome = self.send(&account, &input.model, &proxy).await;
         let (status, state, retry, message) =
             outcome.unwrap_or_else(|_| (0, String::new(), 60, "请求失败或超时".into()));
         let current = self
@@ -410,7 +501,7 @@ impl TicketService {
             429 => retry.max(60),
             401 | 403 => 900,
             0 => 60,
-            _ => snapshot.settings.interval_seconds,
+            _ => 0,
         };
         o.retry
             .insert(input.account_id.clone(), now().saturating_add(delay));
@@ -524,6 +615,14 @@ fn valid_proxy(raw: &str) -> bool {
             && u.fragment().is_none()
             && matches!(u.path(), "" | "/")
     })
+}
+
+fn split_proxy_pool(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {

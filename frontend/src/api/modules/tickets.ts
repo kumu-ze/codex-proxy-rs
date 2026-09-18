@@ -11,6 +11,7 @@ export interface TicketSettings {
   defaultLength: number
   models: string[]
   intervalSeconds: number
+  manualIntervalSeconds: number
   ttlSeconds: number
   refreshBeforeSeconds: number
   accounts: Record<string, TicketPolicy>
@@ -31,9 +32,9 @@ export interface TicketAccount {
   eligible: boolean
   targetLength: number
   policy: TicketPolicy
-  models: { model: string, ready: boolean, expiresAt: number | null, lastResult: TicketResult | null, busy: boolean, retryAt: number | null }[]
+  models: { model: string, ready: boolean, expiresAt: number | null, lastResult: TicketResult | null, busy: boolean, retryAt: number | null, manualRetryAt: number | null }[]
 }
-export interface TicketPanel { revision: number, settings: TicketSettings, proxyConfigured: boolean, accounts: TicketAccount[] }
+export interface TicketPanel { revision: number, settings: TicketSettings, proxyConfigured: boolean, proxyCount: number, accounts: TicketAccount[] }
 
 export function getTicketPanel(options: RequestOptions = {}) {
   return request<TicketPanel>({
@@ -42,7 +43,7 @@ export function getTicketPanel(options: RequestOptions = {}) {
     ...options,
   })
 }
-export function saveTicketSettings(data: { revision: number, settings: TicketSettings, proxyUrl?: string }) {
+export function saveTicketSettings(data: { revision: number, settings: TicketSettings, proxyUrl?: string, proxyPool?: string[] }) {
   return request<TicketPanel>({
     url: '/api/admin/tickets',
     method: 'POST',

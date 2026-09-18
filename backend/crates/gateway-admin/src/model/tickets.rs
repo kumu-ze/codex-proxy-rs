@@ -29,6 +29,8 @@ pub struct TicketSettings {
     pub default_length: usize,
     pub models: Vec<String>,
     pub interval_seconds: u64,
+    #[serde(default)]
+    pub manual_interval_seconds: u64,
     pub ttl_seconds: u64,
     pub refresh_before_seconds: u64,
     pub accounts: BTreeMap<String, TicketAccountPolicy>,
@@ -44,6 +46,7 @@ impl Default for TicketSettings {
             default_length: 292,
             models: vec!["gpt-6-astra".into(), "gpt-5.6-sol".into()],
             interval_seconds: 60,
+            manual_interval_seconds: 0,
             ttl_seconds: 3600,
             refresh_before_seconds: 600,
             accounts: BTreeMap::new(),
@@ -70,6 +73,7 @@ impl TicketSettings {
             && length_ok(self.business_length)
             && length_ok(self.default_length)
             && (10..=86400).contains(&self.interval_seconds)
+            && self.manual_interval_seconds <= 86400
             && (60..=3600).contains(&self.ttl_seconds)
             && self.refresh_before_seconds < self.ttl_seconds
             && !self.models.is_empty()
@@ -129,6 +133,7 @@ pub struct TicketModelStatus {
     pub last_result: Option<TicketResult>,
     pub busy: bool,
     pub retry_at: Option<u64>,
+    pub manual_retry_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +142,7 @@ pub struct TicketPanel {
     pub revision: u64,
     pub settings: TicketSettings,
     pub proxy_configured: bool,
+    pub proxy_count: usize,
     pub accounts: Vec<TicketAccountStatus>,
 }
 
@@ -147,6 +153,8 @@ pub struct TicketUpdate {
     pub revision: u64,
     pub settings: TicketSettings,
     pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub proxy_pool: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
