@@ -2,12 +2,13 @@
 import type { OutboundProxyRecord } from '@/api/modules/proxies'
 import type { TicketAccount, TicketMode, TicketPanel, TicketPolicy, TicketProxyInput, TicketSettings } from '@/api/modules/tickets'
 import { ChevronLeft, ChevronRight, Plus, Trash2 } from '@lucide/vue'
-import { useIntervalFn } from '@vueuse/core'
+import { useEventListener, useIntervalFn, useLocalStorage } from '@vueuse/core'
 import { computed, onMounted, ref, toRaw, watch } from 'vue'
 import { getProxies } from '@/api/modules/proxies'
-import { continuousTicket, getTicketPanel, probeTicket, saveTicketSettings } from '@/api/modules/tickets'
+import { clearTicketLogs, continuousTicket, getTicketPanel, probeTicket, saveTicketSettings } from '@/api/modules/tickets'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
+import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
@@ -72,13 +73,26 @@ const search = ref('')
 const logSearch = ref('')
 const logOutcome = ref('all')
 const logPage = ref(1)
+const logPageSize = useLocalStorage('rs-ticket-log-page-size', '25')
+const logPageSizeOptions = [10, 25, 50, 100].map(n => ({ label: `每页 ${n} 条`, value: String(n) }))
+const effectivePageSize = computed(() => [10, 25, 50, 100].includes(Number(logPageSize.value)) ? Number(logPageSize.value) : 25)
+const confirmClearLogs = ref(false)
+const clearingLogs = ref(false)
+const lastStatusRefresh = ref<number | null>(null)
+const statusRefreshFailed = ref(false)
+const pendingNewLogs = ref(false)
+const activeContinuous = computed(() => (panel.value?.accounts ?? []).flatMap(a => a.models.filter(m => m.continuous).map(m => ({ account: a.name, ...m }))))
 const logOptions = [{ label: '全部结果', value: 'all' }, { label: '已命中', value: 'matched' }, { label: '未命中 / 失败', value: 'failed' }]
 const filteredLogs = computed(() => (panel.value?.logs ?? []).filter((log) => {
   const text = `${log.accountName} ${log.result.accountId} ${log.result.model} ${log.proxyName ?? ''} ${log.proxyEndpoint} ${log.result.httpStatus} ${log.result.message}`.toLowerCase()
   return text.includes(logSearch.value.toLowerCase()) && (logOutcome.value === 'all' || log.result.matched === (logOutcome.value === 'matched'))
 }))
-const logPages = computed(() => Math.max(1, Math.ceil(filteredLogs.value.length / 25)))
-const visibleLogs = computed(() => filteredLogs.value.slice((logPage.value - 1) * 25, logPage.value * 25))
+const logPages = computed(() => Math.max(1, Math.ceil(filteredLogs.value.length / effectivePageSize.value)))
+const visibleLogs = computed(() => filteredLogs.value.slice((logPage.value - 1) * effectivePageSize.value, logPage.value * effectivePageSize.value))
+watch(() => panel.value?.logs[0]?.id, (id, previous) => {
+  if (id && previous && id !== previous && logPage.value > 1)
+    pendingNewLogs.value = true
+})
 const proxyStats = computed(() => {
   const stats = new Map<string, { endpoint: string, count: number, matched: number }>()
   for (const log of panel.value?.logs ?? []) {
@@ -89,7 +103,7 @@ const proxyStats = computed(() => {
   }
   return [...stats.values()].sort((a, b) => b.matched - a.matched || b.count - a.count)
 })
-watch([logSearch, logOutcome], () => {
+watch([logSearch, logOutcome, logPageSize], () => {
   logPage.value = 1
 })
 watch(logPages, (pages) => {
@@ -109,6 +123,8 @@ const rows = computed(() => (panel.value?.accounts ?? []).filter(a => `${a.name}
 const readyCount = computed(() => panel.value?.accounts.reduce((n, a) => n + a.models.filter(m => m.ready).length, 0) ?? 0)
 
 function accept(data: TicketPanel) {
+  lastStatusRefresh.value = Date.now() / 1000
+  statusRefreshFailed.value = false
   panel.value = data
   draftRevision.value = data.revision
   draft.value = structuredClone(data.settings)
@@ -225,25 +241,53 @@ async function continuous(account: TicketAccount, model: string, stop = false) {
   controlling.value = key
   try {
     panel.value = await continuousTicket({ ...manualInput(account.id, model), intervalSeconds: stop ? null : interval })
+    if (!stop)
+      showLatestLogs()
     toast.success(stop ? '持续打标已停止' : '已提交持续打标，命中后自动停止')
   }
   catch {}
   finally { controlling.value = '' }
 }
 onMounted(load)
-useIntervalFn(async () => {
-  if (loading.value || saving.value || probing.value || controlling.value || !panel.value || polling || document.hidden)
+function showLatestLogs() {
+  logPage.value = 1
+  logSearch.value = ''
+  logOutcome.value = 'all'
+  pendingNewLogs.value = false
+}
+async function clearLogs() {
+  generation += 1
+  clearingLogs.value = true
+  try {
+    panel.value = await clearTicketLogs()
+    showLatestLogs()
+    confirmClearLogs.value = false
+    toast.success('历史记录已清理，有效票和正在运行的任务已保留')
+  }
+  catch {}
+  finally { clearingLogs.value = false }
+}
+async function refreshStatus() {
+  if (loading.value || saving.value || probing.value || controlling.value || clearingLogs.value || !panel.value || polling || document.hidden)
     return
   polling = true
   const started = generation
   try {
     const data = await getTicketPanel({ silent: true })
-    if (started === generation)
+    if (started === generation) {
       panel.value = data
+      lastStatusRefresh.value = Date.now() / 1000
+      statusRefreshFailed.value = false
+    }
   }
-  catch {}
+  catch { statusRefreshFailed.value = true }
   finally { polling = false }
-}, computed(() => panel.value?.accounts.some(a => a.models.some(m => m.continuous)) ? 3000 : 10000))
+}
+useIntervalFn(refreshStatus, computed(() => activeContinuous.value.length ? 3000 : 10000))
+useEventListener(document, 'visibilitychange', () => {
+  if (!document.hidden)
+    void refreshStatus()
+})
 </script>
 
 <template>
@@ -408,10 +452,28 @@ useIntervalFn(async () => {
             打标日志
           </h2>
           <span class="text-sm text-cp-text-secondary">最近 {{ panel.logs?.length ?? 0 }} / {{ panel.logLimit ?? 1000 }} 条</span>
+          <div class="flex gap-2">
+            <BaseButton :disabled="polling || clearingLogs" @click="refreshStatus">
+              刷新记录
+            </BaseButton>
+            <BaseButton :disabled="!panel.logs?.length || clearingLogs" @click="confirmClearLogs = true">
+              清理记录
+            </BaseButton>
+          </div>
         </div>
         <p class="mt-2 text-sm text-cp-text-secondary">
           代理地址不等于真实出口 IP；动态代理的出口 IP 未确认。日志从本次升级后开始记录。
         </p>
+        <p class="mt-2 text-xs text-cp-text-secondary" role="status">
+          {{ statusRefreshFailed ? '状态刷新失败，请点击刷新记录重试。' : `最近刷新：${time(lastStatusRefresh)}` }}
+          记录在每次探测完成后出现；等待间隔和退避期间不会新增记录。
+        </p>
+        <p v-for="job in activeContinuous" :key="`${job.account}/${job.model}`" class="mt-2 text-sm text-cp-text-secondary">
+          {{ job.account }} · {{ job.model }} · {{ job.busy ? '持续打标请求进行中…' : `持续打标等待中，下次检查 ${time(job.continuous?.nextProbeAt)}` }}
+        </p>
+        <BaseButton v-if="pendingNewLogs || logSearch || logOutcome !== 'all' || logPage > 1" class="mt-2" @click="showLatestLogs">
+          {{ pendingNewLogs ? '有新记录，查看最新' : '清除筛选并查看最新' }}
+        </BaseButton>
         <div v-if="proxyStats.length" class="mt-4 overflow-x-auto">
           <table class="w-full text-left text-sm">
             <thead>
@@ -472,7 +534,7 @@ useIntervalFn(async () => {
               <tr v-for="log in visibleLogs" :key="log.id" class="odd:bg-cp-fill-quaternary">
                 <td class="p-3 align-top">
                   {{ time(log.startedAt) }}<div class="mt-1 text-cp-text-secondary">
-                    {{ log.trigger === 'auto' ? '自动' : '手动' }}
+                    {{ log.trigger === 'auto' ? '自动' : log.continuous ? '手动持续' : '手动单次' }}
                   </div>
                 </td>
                 <td class="max-w-56 break-all p-3 align-top">
@@ -509,7 +571,8 @@ useIntervalFn(async () => {
             </tbody>
           </table>
         </div>
-        <div class="mt-4 flex items-center justify-end gap-3">
+        <div class="mt-4 flex flex-wrap items-center justify-end gap-3">
+          <BaseSelect v-model="logPageSize" :options="logPageSizeOptions" aria-label="每页打标记录数" class="w-36" />
           <span class="text-sm text-cp-text-secondary">{{ filteredLogs.length }} 条 · {{ logPage }} / {{ logPages }}</span>
           <BaseButton aria-label="上一页日志" title="上一页日志" :disabled="logPage <= 1" @click="logPage--">
             <ChevronLeft :size="16" />
@@ -519,6 +582,9 @@ useIntervalFn(async () => {
           </BaseButton>
         </div>
       </section>
+      <BaseConfirmModal v-model="confirmClearLogs" title="清理打标记录" confirm-text="确认清理" destructive :loading="clearingLogs" @confirm="clearLogs">
+        清理全部历史记录及其统计，不可撤销。有效票、代理设置、退避和持续任务保持不变，之后完成的探测会生成新记录。
+      </BaseConfirmModal>
     </template>
   </div>
 </template>

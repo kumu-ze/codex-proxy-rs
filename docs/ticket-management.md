@@ -64,6 +64,10 @@ HTTP 429 遵循 Retry-After，至少退避一分钟；401/403 退避十五分钟
 面板保留最近 1000 条已执行探测记录，按新到旧显示；成功、未命中、限流和网络失败均记录。
 包含账号、模型、触发方式、脱敏代理地址、HTTP 状态、实际/目标长度、耗时、退避时间和结果原因。
 支持搜索、按命中结果筛选和分页，并汇总保留记录内各代理的命中次数及比例。
+可选择每页 10、25、50、100 条，浏览器记住选择；新记录在其他分页或筛选条件下会提供查看最新的入口。
+持续任务的记录标记为「手动持续」，每次探测结束后写入；等待间隔或退避期间没有新请求记录，日志区会显示运行/等待状态。
+「清理记录」经确认后清空全部历史及统计，不删除有效票、配置或持续任务，不重置限流退避。
+清理后完成的在途请求仍会产生新记录。页面提供单独刷新记录按钮，切回前台自动更新状态。
 日志随私有状态文件持久化，保存策略不清空历史。历史版本没有记录的尝试无法补回。
 并发占用或冷却期内拒绝的点击没有实际发出探测，不算探测记录；进程中止的在途请求可能没有完成记录。
 不保存票原文、代理用户名密码、令牌或上游正文。代理地址是连接入口，不能当作动态代理的实际出口 IP；真实出口未经该请求关联确认时不显示为已确认。
@@ -111,6 +115,7 @@ Linux 上新文件权限为 0600。文件包含代理认证和票材料，应按
 - `POST /api/admin/tickets`：提交 `{revision, settings, proxies?, proxyUrl?, proxyPool?}`。代理字段只选一个，省略保留，空池清除。`proxies` 条目为 `{id?, name, url?, savedProxyId?, enabled?, concurrency?}`，已有条目省略 URL 保留认证，导入使用 `savedProxyId`；省略 enabled/concurrency 保留旧条目值，新条目默认为 true/1，并发只接受 1–3。`settings.manualIntervalSeconds` 省略时为 0，`settings.proxyPoolEnabled` 省略时为 true。
 - `POST /api/admin/tickets/probe`：提交 `{accountId, model, proxyId?, revision?}`，单次探测并返回状态摘要。省略 proxyId 时池内轮换，指定代理必须同时传当前 revision。
 - `POST /api/admin/tickets/continuous`：提交 `{accountId, model, intervalSeconds, proxyId?, revision?}`，intervalSeconds 为 10–86400 时启动，为 null 时停止。指定代理要求当前 revision，停止不依赖 revision。面板各模型的 continuous 字段返回间隔、下次检查时间及当前代理 ID，停止后为 null。
+- `POST /api/admin/tickets/logs/clear`：清理可见日志并返回更新后的面板；不推进策略 revision，不清空有效票或退避检查点。
 
 响应沿用 RS `{code, message, data}` 信封。探测匹配与否是 `data.matched`，不是管理接口
 自身 HTTP 状态。冲突或冷却返回 409，不合法策略返回 400；响应包含 `Cache-Control: no-store`。

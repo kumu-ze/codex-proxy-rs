@@ -282,6 +282,20 @@ async fn ticket_continuous_waits_retries_and_stops_on_match_without_restart_resu
     let p = admin.ticket_panel().await.unwrap();
     assert_eq!(p.logs.len(), 1);
     assert_eq!(p.logs[0].trigger, TicketMode::Manual);
+    assert!(p.logs[0].continuous);
+    let cleared = admin.clear_ticket_logs().await.unwrap();
+    assert!(cleared.logs.is_empty());
+    assert_eq!(cleared.revision, p.revision);
+    assert!(
+        cleared
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .continuous
+            .is_some()
+    );
     assert!(
         p.accounts
             .iter()
@@ -313,7 +327,7 @@ async fn ticket_continuous_waits_retries_and_stops_on_match_without_restart_resu
         .models[0];
     assert!(model.ready);
     assert!(model.continuous.is_none());
-    assert_eq!(p.logs.len(), 2);
+    assert_eq!(p.logs.len(), 1);
 }
 
 #[tokio::test]
@@ -460,6 +474,18 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
         .await
         .unwrap();
     assert!(outcome.matched);
+    let cleared = admin.clear_ticket_logs().await.unwrap();
+    assert!(cleared.logs.is_empty());
+    assert_eq!(cleared.revision, updated.revision);
+    assert!(
+        cleared
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .ready
+    );
     let body = serde_json::to_string(&admin.ticket_panel().await.unwrap()).unwrap();
     assert!(!body.contains(&ticket));
     assert!(!body.contains("ticket-test-only"));
@@ -541,7 +567,7 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
 
 #[tokio::test]
 async fn ticket_429_never_creates_a_ticket_and_stops_immediate_retries() {
-    let (_config, _store, server, bundle) = setup().await;
+    let (config, store, server, bundle) = setup().await;
     let admin = bundle.admin_provider();
     let mut panel = admin.ticket_panel().await.unwrap();
     panel.settings.enabled = true;
@@ -588,6 +614,37 @@ async fn ticket_429_never_creates_a_ticket_and_stops_immediate_retries() {
     assert_eq!(panel.logs[0].result.http_status, 429);
     assert!(panel.logs[0].retry_at.is_some());
     assert!(account.models.iter().all(|m| m.retry_at.is_some()));
+    let cleared = admin.clear_ticket_logs().await.unwrap();
+    assert!(cleared.logs.is_empty());
+    let restored = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let restored_panel = restored.admin_provider().ticket_panel().await.unwrap();
+    assert!(restored_panel.logs.is_empty());
+    assert!(
+        restored_panel
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models
+            .iter()
+            .all(|m| m.manual_retry_at.is_some())
+    );
+    assert!(
+        restored
+            .admin_provider()
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-6-astra".into(),
+                ..Default::default()
+            })
+            .await
+            .is_err()
+    );
     assert!(
         admin
             .probe_ticket(TicketProbe {

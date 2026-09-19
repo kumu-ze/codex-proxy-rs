@@ -125,6 +125,8 @@ pub struct TicketLog {
     pub id: String,
     pub account_name: String,
     pub trigger: TicketMode,
+    #[serde(default)]
+    pub continuous: bool,
     pub proxy_endpoint: String,
     #[serde(default)]
     pub proxy_name: String,

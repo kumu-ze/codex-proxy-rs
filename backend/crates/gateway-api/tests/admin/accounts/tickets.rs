@@ -12,6 +12,7 @@ async fn ticket_endpoints_require_admin_session() {
     for (uri, method, body) in [
         ("/api/admin/tickets", "GET", ""),
         ("/api/admin/tickets", "POST", "{}"),
+        ("/api/admin/tickets/logs/clear", "POST", ""),
         (
             "/api/admin/tickets/continuous",
             "POST",

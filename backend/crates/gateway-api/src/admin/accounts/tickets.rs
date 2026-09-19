@@ -12,6 +12,7 @@ where
         .route("/api/admin/tickets", get(panel::<S>).post(update::<S>))
         .route("/api/admin/tickets/probe", post(probe::<S>))
         .route("/api/admin/tickets/continuous", post(continuous::<S>))
+        .route("/api/admin/tickets/logs/clear", post(clear_logs::<S>))
 }
 
 async fn panel<S>(_auth: AdminAuth, State(state): State<S>) -> Result<impl IntoResponse, AdminError>
@@ -22,6 +23,22 @@ where
         .admin_services()
         .accounts()
         .ticket_panel()
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
+}
+
+async fn clear_logs<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let data = state
+        .admin_services()
+        .accounts()
+        .clear_ticket_logs(&auth.context().mutation_context())
         .await
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))

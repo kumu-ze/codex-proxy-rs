@@ -58,6 +58,15 @@ struct Persisted {
     tickets: Vec<Ticket>,
     #[serde(default)]
     logs: Vec<TicketLog>,
+    #[serde(default)]
+    cooldown_checkpoints: Vec<CooldownCheckpoint>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CooldownCheckpoint {
+    last: TicketResult,
+    retry_at: Option<u64>,
+    manual_retry_at: Option<u64>,
 }
 
 impl Default for Persisted {
@@ -72,6 +81,7 @@ impl Default for Persisted {
             proxy_concurrency: Vec::new(),
             tickets: Vec::new(),
             logs: Vec::new(),
+            cooldown_checkpoints: Vec::new(),
         }
     }
 }
@@ -218,6 +228,19 @@ impl TicketService {
             data.logs.drain(..data.logs.len() - LOG_LIMIT);
         }
         let mut observations = Observations::default();
+        for checkpoint in &data.cooldown_checkpoints {
+            let id = checkpoint.last.account_id.clone();
+            observations.last.insert(
+                (id.clone(), checkpoint.last.model.clone()),
+                checkpoint.last.clone(),
+            );
+            if let Some(t) = checkpoint.retry_at.filter(|t| *t > now()) {
+                observations.retry.insert(id.clone(), t);
+            }
+            if let Some(t) = checkpoint.manual_retry_at.filter(|t| *t > now()) {
+                observations.manual_retry.insert(id, t);
+            }
+        }
         for log in &data.logs {
             observations.last.insert(
                 (log.result.account_id.clone(), log.result.model.clone()),
@@ -655,6 +678,50 @@ impl TicketService {
             .map(|t| t.state.clone())
     }
 
+    pub(crate) async fn clear_logs(&self) -> Result<TicketPanel, ProviderAdminError> {
+        let guard = Arc::clone(&self.persistence).lock_owned().await;
+        let mut next = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if next.logs.is_empty() {
+            drop(guard);
+            return self.panel().await;
+        }
+        // 清理可见历史不重置限流；每账号最多保留一个尚影响间隔/退避的检查点。
+        let mut checkpoints = BTreeMap::<String, CooldownCheckpoint>::new();
+        for checkpoint in &next.cooldown_checkpoints {
+            checkpoints.insert(checkpoint.last.account_id.clone(), checkpoint.clone());
+        }
+        for log in &next.logs {
+            let entry = checkpoints
+                .entry(log.result.account_id.clone())
+                .or_insert_with(|| CooldownCheckpoint {
+                    last: log.result.clone(),
+                    retry_at: None,
+                    manual_retry_at: None,
+                });
+            if log.result.checked_at >= entry.last.checked_at {
+                entry.last = log.result.clone();
+            }
+            entry.retry_at = entry.retry_at.max(log.retry_at);
+            if matches!(log.result.http_status, 429 | 401 | 403) {
+                entry.manual_retry_at = entry.manual_retry_at.max(log.retry_at);
+            }
+        }
+        next.cooldown_checkpoints = checkpoints
+            .into_values()
+            .filter(|c| {
+                c.last.checked_at.saturating_add(86400) > now()
+                    || c.retry_at.is_some_and(|t| t > now())
+            })
+            .collect();
+        next.logs.clear();
+        self.commit(next, guard).await?;
+        self.panel().await
+    }
+
     pub(crate) async fn continuous(
         &self,
         input: TicketContinuousInput,
@@ -776,7 +843,7 @@ impl TicketService {
                     tokio::select! {
                         () = context.cancellation().cancelled() => return,
                         () = run.cancellation.cancelled() => return,
-                        result = self.probe(TicketProbe { account_id: key.0.clone(), model: key.1.clone(), proxy_id, revision: Some(revision) }) => Some(result),
+                        result = self.probe_on_proxy(TicketProbe { account_id: key.0.clone(), model: key.1.clone(), proxy_id, revision: Some(revision) }, false, None, true) => Some(result),
                     }
                 };
                 let mut o = self.observations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -810,7 +877,7 @@ impl TicketService {
         input: TicketProbe,
         automatic: bool,
     ) -> Result<TicketResult, ProviderAdminError> {
-        self.probe_on_proxy(input, automatic, None).await
+        self.probe_on_proxy(input, automatic, None, false).await
     }
 
     async fn probe_on_proxy(
@@ -818,6 +885,7 @@ impl TicketService {
         input: TicketProbe,
         automatic: bool,
         forced_proxy: Option<usize>,
+        continuous: bool,
     ) -> Result<TicketResult, ProviderAdminError> {
         let _permit = self
             .request_slot
@@ -1028,6 +1096,7 @@ impl TicketService {
             } else {
                 TicketMode::Manual
             },
+            continuous,
             proxy_endpoint: proxy_endpoint(&proxy),
             proxy_name,
             target_length: target,
@@ -1372,6 +1441,7 @@ impl ScheduledTask for TicketTask {
                     },
                     true,
                     Some(index),
+                    false,
                 )
             }));
             tokio::select! {

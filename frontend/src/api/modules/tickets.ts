@@ -39,6 +39,7 @@ export interface TicketLog {
   id: string
   accountName: string
   trigger: TicketMode
+  continuous: boolean
   proxyEndpoint: string
   proxyName: string
   targetLength: number
@@ -79,5 +80,11 @@ export function continuousTicket(data: TicketProbeInput & { intervalSeconds: num
     url: '/api/admin/tickets/continuous',
     method: 'POST',
     data,
+  })
+}
+export function clearTicketLogs() {
+  return request<TicketPanel>({
+    url: '/api/admin/tickets/logs/clear',
+    method: 'POST',
   })
 }

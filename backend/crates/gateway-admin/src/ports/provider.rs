@@ -128,6 +128,13 @@ pub trait ProviderAdmin: Send + Sync {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }
 
+    /// 清理可见历史，不改变有效票或请求退避。
+    async fn clear_ticket_logs(
+        &self,
+    ) -> Result<crate::model::tickets::TicketPanel, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     /// 启动或停止管理员指定的持续打标任务。
     async fn continuous_ticket(
         &self,
