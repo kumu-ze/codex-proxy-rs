@@ -143,7 +143,7 @@ async function save() {
     toast.success('代理已保存')
     search.value = ''
     query.page.value = 1
-    await query.execute()
+    void query.execute()
   })
 }
 
@@ -159,8 +159,8 @@ async function confirmDelete() {
   await deleteAction.run(async () => {
     await deleteProxy({ id: proxy.id, revision: proxy.revision })
     showDelete.value = false
-    await query.execute()
     toast.success('代理已删除')
+    void query.execute()
   })
 }
 

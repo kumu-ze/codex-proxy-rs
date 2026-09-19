@@ -130,6 +130,72 @@ async fn setup() -> (
 }
 
 #[tokio::test]
+async fn runtime_catalog_read_returns_immediately_and_coalesces_background_refresh() {
+    let (_config, _store, server, mut bundle) = setup().await;
+    Mock::given(method("GET")).and(path("/codex/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models":[{"slug":"gpt-5.4","display_name":"GPT-5.4","supported_in_api":true}]})).set_delay(Duration::from_millis(300)))
+        .expect(1).mount(&server).await;
+    let provider = bundle.core_provider();
+    let registry =
+        gateway_core::engine::provider::ProviderRegistry::new([Arc::clone(&provider)]).unwrap();
+    let kind = ProviderKind::new("openai").unwrap();
+    for _ in 0..5 {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                gateway_core::routing::ProviderCatalogPort::query_model_capabilities(
+                    &registry, &kind
+                )
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let registration = bundle
+        .take_worker_contributions()
+        .into_iter()
+        .find_map(|c| match c {
+            WorkerContribution::Registration(r) if r.id.owner() == "openai-model-etag" => Some(r),
+            _ => None,
+        })
+        .unwrap();
+    let WorkerRunnable::Daemon { task, .. } = registration.runnable else {
+        panic!("daemon expected")
+    };
+    let cancellation = CancellationToken::new();
+    let worker = task.run(cancellation.clone());
+    tokio::pin!(worker);
+    tokio::select! { result=&mut worker=>panic!("worker stopped early: {result:?}"),()=tokio::time::sleep(Duration::from_millis(100))=>{} }
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            provider.query_snapshot_model_capabilities()
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    tokio::select! { result=&mut worker=>panic!("worker stopped early: {result:?}"),()=tokio::time::sleep(Duration::from_millis(500))=>{} }
+    let models = tokio::time::timeout(
+        Duration::from_millis(100),
+        provider.query_snapshot_model_capabilities(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        models
+            .iter()
+            .any(|m| m.upstream_model().as_str() == "gpt-5.4")
+    );
+    cancellation.cancel();
+    worker.await.unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn ticket_selected_proxy_and_noop_save_preserve_inflight_result() {
     let (_config, _store, first, bundle) = setup().await;
     let second = MockServer::start().await;

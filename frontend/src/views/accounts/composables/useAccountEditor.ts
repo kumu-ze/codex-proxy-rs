@@ -133,8 +133,10 @@ export function useAccountEditor(options: {
         await updateAccount(settings)
       }
       showEditModal.value = false
-      await Promise.all([options.reloadAccounts(), options.reloadGroups()])
       toast.success('账号已更新')
+      void Promise.all([options.reloadAccounts(), options.reloadGroups()]).catch(() => {
+        toast.warning('账号已保存，列表刷新失败，请手动刷新')
+      })
     })
   }
 

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -241,6 +242,7 @@ pub struct CodexCredentialCatalogService {
     client_catalogs: Arc<Mutex<Vec<ClientCatalogEntry>>>,
     etags: Arc<Mutex<CatalogEtagState>>,
     etag_notification: Arc<Notify>,
+    snapshot_refresh_requested: Arc<AtomicBool>,
 }
 
 impl CodexCredentialCatalogService {
@@ -261,6 +263,7 @@ impl CodexCredentialCatalogService {
             client_catalogs: Arc::new(Mutex::new(Vec::new())),
             etags: Arc::new(Mutex::new(CatalogEtagState::default())),
             etag_notification: Arc::new(Notify::new()),
+            snapshot_refresh_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -738,10 +741,22 @@ impl CodexCredentialCatalogService {
         Ok(changed)
     }
 
-    /// 等待并认领一次需要强制刷新的 Provider 目录。
+    /// 合并配置快照缺失触发的刷新请求，复用受 Host 监督的目录任务。
+    pub fn request_snapshot_refresh(&self) {
+        self.snapshot_refresh_requested
+            .store(true, Ordering::Release);
+        self.etag_notification.notify_one();
+    }
+
+    /// 快照缺失与 ETag 变化共用受 Host 管理的刷新任务，不为每次保存启动后台任务。
     pub async fn wait_for_etag_refresh(&self) {
         loop {
-            if self.begin_pending_etag_refresh() {
+            let snapshot_requested = self
+                .snapshot_refresh_requested
+                .swap(false, Ordering::AcqRel)
+                && self.cached().map_or(true, |cache| cache.is_none());
+            let etag_requested = self.begin_pending_etag_refresh();
+            if snapshot_requested || etag_requested {
                 return;
             }
             self.etag_notification.notified().await;

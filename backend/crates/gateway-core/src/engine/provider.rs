@@ -520,6 +520,13 @@ pub trait Provider: Send + Sync {
         &self,
     ) -> Result<Vec<ProviderModelCapabilities>, ProviderError>;
 
+    /// 配置快照编译读取目录；支持后台刷新的 Provider 应只返回本地事实，避免保存等待上游。
+    async fn query_snapshot_model_capabilities(
+        &self,
+    ) -> Result<Vec<ProviderModelCapabilities>, ProviderError> {
+        self.query_model_capabilities().await
+    }
+
     /// 读取当前客户端协议的原生目录，必须限定到认证时冻结的账号范围。
     /// `None` 表示不提供该协议的原生目录；读取失败不能伪装成不支持。
     async fn query_client_model_catalog(
@@ -690,7 +697,7 @@ impl ProviderCatalogPort for ProviderRegistry {
         Box::pin(async move {
             provider
                 .ok_or(ProviderCatalogUnavailable)?
-                .query_model_capabilities()
+                .query_snapshot_model_capabilities()
                 .await
                 .map_err(|_| ProviderCatalogUnavailable)
         })

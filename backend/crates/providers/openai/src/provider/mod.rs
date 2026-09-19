@@ -340,6 +340,27 @@ impl Provider for CodexProvider {
             .collect())
     }
 
+    async fn query_snapshot_model_capabilities(
+        &self,
+    ) -> Result<Vec<ProviderModelCapabilities>, ProviderError> {
+        let cached = self.catalog.cached().map_err(|_| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
+        let Some(snapshot) = cached else {
+            self.catalog.request_snapshot_refresh();
+            // 非完整目录的未知状态不影响账号范围/分组/开关等数据库事实立即发布。
+            return Err(provider_error(
+                ProviderErrorKind::Unavailable,
+                UpstreamSendState::NotSent,
+            ));
+        };
+        Ok(snapshot
+            .models()
+            .iter()
+            .map(compile_model_capabilities)
+            .collect())
+    }
+
     async fn query_client_model_catalog(
         &self,
         scope: &gateway_core::account::scope::FrozenAccountScope,
