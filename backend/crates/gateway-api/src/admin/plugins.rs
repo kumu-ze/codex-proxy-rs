@@ -55,6 +55,7 @@ async fn invoke<S: SessionState + Send + Sync>(
         .map_err(|error| match error {
             PluginOperationError::NotFound => AdminError::not_found("插件不存在"),
             PluginOperationError::Invalid => AdminError::bad_request("插件操作无效"),
+            PluginOperationError::Rejected => AdminError::bad_request("插件拒绝了本次操作"),
             PluginOperationError::Unavailable => AdminError::service_unavailable(),
         })?;
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))

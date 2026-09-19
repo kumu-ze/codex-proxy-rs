@@ -18,6 +18,8 @@ pub enum PluginOperationError {
     NotFound,
     #[error("invalid plugin operation")]
     Invalid,
+    #[error("plugin operation rejected")]
+    Rejected,
     #[error("plugin unavailable")]
     Unavailable,
 }

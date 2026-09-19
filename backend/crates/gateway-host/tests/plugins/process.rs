@@ -10,6 +10,9 @@ while True:
     if len(prefix) != 4: break
     request = json.loads(sys.stdin.buffer.read(struct.unpack('>I',prefix)[0]))
     method = request['method']
+    if method == 'reject':
+        body = json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32601,'message':'private diagnostic'}}).encode()
+        sys.stdout.buffer.write(struct.pack('>I',len(body))+body); sys.stdout.buffer.flush(); continue
     if method == 'sleep': time.sleep(2)
     if method == 'oversize':
         sys.stdout.buffer.write(struct.pack('>I', 1048577)); sys.stdout.buffer.flush(); continue
@@ -29,6 +32,14 @@ async fn start(dir: &tempfile::TempDir) -> PluginProcess {
 async fn roundtrip_keeps_environment_private() {
     let dir = super::package(SCRIPT);
     let mut process = start(&dir).await;
+    assert_eq!(
+        process
+            .call("reject", json!({}), Duration::from_secs(1))
+            .await
+            .unwrap_err(),
+        PluginError::Rejected
+    );
+    assert!(process.is_available());
     assert_eq!(
         process
             .call("echo", json!({"value":42}), Duration::from_secs(1))

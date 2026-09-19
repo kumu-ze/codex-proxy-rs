@@ -9,6 +9,9 @@ while True:
     prefix = sys.stdin.buffer.read(4)
     if len(prefix) != 4: break
     request = json.loads(sys.stdin.buffer.read(struct.unpack('>I',prefix)[0]))
+    if request['method'] == 'admin.reject':
+        body = json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32601,'message':'private diagnostic'}}).encode()
+        sys.stdout.buffer.write(struct.pack('>I',len(body))+body); sys.stdout.buffer.flush(); continue
     if request['method'] == 'admin.sleep': time.sleep(2)
     result = request['params']
     body = json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}).encode()
@@ -73,6 +76,18 @@ async fn exited_process_is_reported_unavailable() {
 #[tokio::test]
 async fn shutdown_closes_admission_and_keeps_data() {
     let (_package, data, registry) = registry().await;
+    assert!(matches!(
+        registry.invoke("example", "admin.reject", json!({})).await,
+        Err(gateway_admin::ports::plugins::PluginOperationError::Rejected)
+    ));
+    assert!(registry.list().await[0].available);
+    assert_eq!(
+        registry
+            .invoke("example", "admin.echo", json!({"ok":true}))
+            .await
+            .unwrap(),
+        json!({"ok":true})
+    );
     std::fs::write(data.path().join("saved"), "retained").unwrap();
     registry.shutdown().await;
     assert!(!registry.list().await[0].available);

@@ -21,6 +21,8 @@ pub enum PluginError {
     Io,
     #[error("plugin protocol failed")]
     Protocol,
+    #[error("plugin operation rejected")]
+    Rejected,
     #[error("plugin deadline exceeded")]
     Timeout,
     #[error("plugin is stopped")]

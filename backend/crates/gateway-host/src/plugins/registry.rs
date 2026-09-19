@@ -163,7 +163,9 @@ impl RequestExtension for PluginRegistry {
                 )
                 .await;
             let result = result.map_err(|_| {
-                entry.available.store(false, Ordering::Release);
+                if !process.is_available() {
+                    entry.available.store(false, Ordering::Release);
+                }
                 ExtensionUnavailable
             })?;
             let next: ExtensionDecision =
@@ -237,9 +239,12 @@ impl PluginOperations for PluginRegistry {
             return Err(PluginOperationError::Unavailable);
         }
         let result = process.call(method, input, Duration::from_secs(5)).await;
-        if result.is_err() {
+        if result.is_err() && !process.is_available() {
             entry.available.store(false, Ordering::Release);
         }
-        result.map_err(|_| PluginOperationError::Unavailable)
+        result.map_err(|error| match error {
+            PluginError::Rejected => PluginOperationError::Rejected,
+            _ => PluginOperationError::Unavailable,
+        })
     }
 }

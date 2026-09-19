@@ -92,7 +92,7 @@ impl PluginProcess {
         let result = tokio::time::timeout(deadline, self.exchange(id, &body))
             .await
             .unwrap_or(Err(PluginError::Timeout));
-        if result.is_err() {
+        if result.is_err() && result != Err(PluginError::Rejected) {
             let _ = self.stop().await;
         } else {
             self.pending = false;
@@ -123,12 +123,21 @@ impl PluginProcess {
             serde_json::from_slice(&buffer).map_err(|_| PluginError::Protocol)?;
         if reply.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
             || reply.get("id").and_then(Value::as_u64) != Some(id)
-            || reply.get("error").is_some()
-            || reply.get("result").is_none()
         {
             return Err(PluginError::Protocol);
         }
-        Ok(reply["result"].take())
+        // 合法业务错误结束本次调用，不能把“方法不支持”误判为进程损坏。
+        // 错误正文可能包含敏感数据，宿主仅返回固定分类。
+        match (reply.get("result"), reply.get("error")) {
+            (Some(_), None) => Ok(reply["result"].take()),
+            (None, Some(error))
+                if error.get("code").and_then(Value::as_i64).is_some()
+                    && error.get("message").and_then(Value::as_str).is_some() =>
+            {
+                Err(PluginError::Rejected)
+            }
+            _ => Err(PluginError::Protocol),
+        }
     }
 
     pub async fn stop(&mut self) -> Result<(), PluginError> {
