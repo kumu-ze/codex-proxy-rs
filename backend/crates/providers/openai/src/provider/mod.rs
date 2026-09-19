@@ -565,7 +565,7 @@ impl Provider for CodexProvider {
                 upstream_model.as_str(),
             )
         }) {
-            upstream_request.turn_state = Some(state);
+            upstream_request.apply_managed_turn_state(state);
         }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = lease

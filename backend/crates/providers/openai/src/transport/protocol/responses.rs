@@ -537,6 +537,37 @@ impl CodexResponsesRequest {
         &mut self.body
     }
 
+    /// 管理票优先于客户端旧票；HTTP/WS opening 与后续 WS 帧使用同一份值。
+    pub(crate) fn apply_managed_turn_state(&mut self, state: String) {
+        self.passthrough_headers
+            .remove(X_CODEX_TURN_STATE_CLIENT_METADATA_KEY);
+        for key in [
+            "turnState",
+            "turn_state",
+            X_CODEX_TURN_STATE_CLIENT_METADATA_KEY,
+        ] {
+            if self.body.contains_key(key) {
+                self.body.insert(key.into(), Value::String(state.clone()));
+            }
+        }
+        let metadata = self
+            .body
+            .entry("client_metadata")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(metadata) = metadata {
+            for key in ["turnState", "turn_state"] {
+                if metadata.contains_key(key) {
+                    metadata.insert(key.into(), Value::String(state.clone()));
+                }
+            }
+            metadata.insert(
+                X_CODEX_TURN_STATE_CLIENT_METADATA_KEY.into(),
+                Value::String(state.clone()),
+            );
+        }
+        self.turn_state = Some(state);
+    }
+
     // --- body 字段类型化访问器（上游语义字段，透传不重写）---
 
     /// 模型名。

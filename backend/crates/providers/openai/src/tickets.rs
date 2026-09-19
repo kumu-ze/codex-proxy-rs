@@ -829,13 +829,13 @@ impl TicketService {
             async move {
                 let model = panel.accounts.iter().find(|a| a.id == key.0 && a.eligible && a.policy.mode != TicketMode::Off)
                     .and_then(|a| a.models.iter().find(|m| m.model == key.1));
-                let (revision, proxy_id, proxy_available) = {
+                let (revision, proxy_index, proxy_available) = {
                     let d = self.data.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let index = run.proxy.as_ref().and_then(|proxy| d.proxy_pool.iter().position(|p| p == proxy));
                     let available = index.map_or_else(
                         || run.proxy.is_none() && (0..d.proxy_pool.len()).any(|i| d.proxy_enabled.get(i).copied().unwrap_or(true)),
                         |i| d.proxy_enabled.get(i).copied().unwrap_or(true));
-                    (d.revision, index.map(|i| i.to_string()), available)
+                    (d.revision, index, available)
                 };
                 let stop = !panel.settings.enabled || !panel.settings.proxy_pool_enabled || !proxy_available || model.is_none_or(|m| m.ready);
                 if !stop && (run.next_probe_at > now() || model.is_some_and(|m| m.busy || m.manual_retry_at.is_some_and(|t| t > now()))) { return; }
@@ -843,26 +843,97 @@ impl TicketService {
                     tokio::select! {
                         () = context.cancellation().cancelled() => return,
                         () = run.cancellation.cancelled() => return,
-                        result = self.probe_on_proxy(TicketProbe { account_id: key.0.clone(), model: key.1.clone(), proxy_id, revision: Some(revision) }, false, None, true) => Some(result),
+                        results = self.probe_continuous_batch(&key, revision, proxy_index) => Some(results),
                     }
                 };
                 let mut o = self.observations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !o.continuous.get(&key).is_some_and(|active| active.id == run.id) { return; }
                 let done = match &outcome {
                     None => true,
-                    Some(Ok(result)) => result.matched,
-                    Some(Err(e)) => matches!(e.kind(), ProviderAdminErrorKind::Invalid | ProviderAdminErrorKind::Internal),
+                    Some(results) => results.iter().any(|r| r.as_ref().is_ok_and(|r| r.matched))
+                        || results.iter().any(|r| r.as_ref().is_err_and(|e| matches!(e.kind(), ProviderAdminErrorKind::Invalid | ProviderAdminErrorKind::Internal))),
                 };
                 if done {
                     if let Some(active) = o.continuous.remove(&key) { active.cancellation.cancel(); }
                 } else if let Some(active) = o.continuous.get_mut(&key) {
-                    let delay = match outcome { Some(Ok(ref r)) if r.http_status == 0 => 60, Some(Err(_)) => 10, _ => 0 };
+                    let delay = if outcome.as_ref().is_some_and(|rs| rs.iter().any(|r| r.as_ref().is_ok_and(|r| r.http_status == 0))) { 60 } else { 0 };
                     active.next_probe_at = now().saturating_add(active.interval_seconds.max(delay));
                 }
             }
         });
         futures::future::join_all(jobs).await;
         Ok(())
+    }
+
+    async fn probe_continuous_batch(
+        &self,
+        key: &(String, String),
+        revision: u64,
+        selected: Option<usize>,
+    ) -> Vec<Result<TicketResult, ProviderAdminError>> {
+        let slots = {
+            let d = self
+                .data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let o = self
+                .observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if o.busy.contains_key(key)
+                || o.retry_at(&key.0, d.settings.manual_interval_seconds, true)
+                    .is_some()
+            {
+                return vec![Err(error(ProviderAdminErrorKind::Conflict))];
+            }
+            let mut slots = Vec::new();
+            let mut endpoints = std::collections::BTreeSet::new();
+            for offset in 0..d.proxy_pool.len() {
+                let i = (o.proxy_cursor + offset) % d.proxy_pool.len();
+                if selected.is_some_and(|s| s != i)
+                    || !d.proxy_enabled.get(i).copied().unwrap_or(true)
+                {
+                    continue;
+                }
+                let endpoint = proxy_endpoint(&d.proxy_pool[i]);
+                if !endpoints.insert(endpoint.clone()) {
+                    continue;
+                }
+                let limit = d
+                    .proxy_pool
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, p)| {
+                        d.proxy_enabled.get(*j).copied().unwrap_or(true)
+                            && proxy_endpoint(p) == endpoint
+                    })
+                    .map(|(j, _)| d.proxy_concurrency.get(j).copied().unwrap_or(1))
+                    .min()
+                    .unwrap_or(1);
+                let available =
+                    limit.saturating_sub(o.proxy_busy.get(&endpoint).copied().unwrap_or(0));
+                for _ in 0..available {
+                    if slots.len() < MAX_PROBE_CONCURRENCY {
+                        slots.push(i);
+                    }
+                }
+            }
+            slots
+        };
+        futures::future::join_all(slots.into_iter().map(|i| {
+            self.probe_on_proxy(
+                TicketProbe {
+                    account_id: key.0.clone(),
+                    model: key.1.clone(),
+                    proxy_id: Some(i.to_string()),
+                    revision: Some(revision),
+                },
+                false,
+                Some(i),
+                true,
+            )
+        }))
+        .await
     }
 
     pub(crate) async fn probe(
@@ -952,14 +1023,16 @@ impl TicketService {
             } else {
                 snapshot.settings.manual_interval_seconds
             };
-            if o.retry_at(&input.account_id, interval, !automatic)
-                .is_some()
+            // 持续批次在派发前统一检查冷却，不因同批先完成的一发阻止其余并发槽。
+            if !continuous
+                && o.retry_at(&input.account_id, interval, !automatic)
+                    .is_some()
             {
                 return Err(error(ProviderAdminErrorKind::Conflict)
                     .with_public_message("账号仍在探测间隔或上游错误退避中，请稍后重试"));
             }
             let key = (input.account_id.clone(), input.model.clone());
-            if !automatic && o.busy.contains_key(&key) {
+            if !automatic && !continuous && o.busy.contains_key(&key) {
                 return Err(error(ProviderAdminErrorKind::Conflict)
                     .with_public_message("该账号模型已有探测正在执行"));
             }

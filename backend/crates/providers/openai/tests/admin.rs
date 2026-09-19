@@ -732,14 +732,32 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
         }
         let payload = ProtocolPayload::json_object(
             "openai",
-            json!({"model":"gpt-5.4","input":"hello"})
+            json!({"model":"gpt-5.4","input":"hello","client_metadata":{"x-codex-turn-state":"stale-body","custom":"keep"}})
                 .as_object()
                 .unwrap()
                 .clone(),
         )
         .unwrap()
-        .with_context(Map::from_iter([("use_websocket".into(), json!(false))]));
-        let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
+        .with_context(Map::from_iter([
+            ("use_websocket".into(), json!(false)),
+            ("opaque_request_headers".into(),json!([["x-codex-turn-state",base64::engine::general_purpose::STANDARD.encode("stale-header")]])),
+        ]));
+        let generate = GenerateRequest::from_protocol_payload(payload);
+        let generate = if index == 0 {
+            generate.with_provider_session_state(
+                gateway_core::operation::ProviderSessionState::new(
+                    "openai",
+                    json!({"account_id":id,"continuation_scope":"persisted"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )
+                .unwrap(),
+            )
+        } else {
+            generate
+        };
+        let operation = Operation::Generate(generate);
         let mut stream = bundle
             .core_provider()
             .execute(
@@ -757,6 +775,18 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
         requests[0].headers.get("x-codex-turn-state").unwrap(),
         ticket.as_str()
     );
+    let decoded = if requests[0]
+        .headers
+        .get("content-encoding")
+        .is_some_and(|v| v == "zstd")
+    {
+        zstd::stream::decode_all(std::io::Cursor::new(&requests[0].body)).unwrap()
+    } else {
+        requests[0].body.clone()
+    };
+    let body: Value = serde_json::from_slice(&decoded).unwrap();
+    assert_eq!(body["client_metadata"]["x-codex-turn-state"], ticket);
+    assert_eq!(body["client_metadata"]["custom"], "keep");
     assert!(!requests[1].headers.contains_key("x-codex-turn-state"));
     assert!(!requests[2].headers.contains_key("x-codex-turn-state"));
 }
@@ -1400,6 +1430,190 @@ async fn ticket_auto_uses_proxy_limits_skips_disabled_and_releases_completed_slo
             .await
             .is_err()
     );
+    assert_eq!(admin.ticket_panel().await.unwrap().logs.len(), 3);
+}
+
+#[tokio::test]
+async fn ticket_replaces_old_state_in_websocket_opening_and_payload() {
+    use futures::SinkExt;
+    let (mut config, store, probe_server, _) = setup().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.config.api.base_url = format!("http://{}", listener.local_addr().unwrap());
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let mut p = admin.ticket_panel().await.unwrap();
+    p.settings.enabled = true;
+    p.settings.inject = true;
+    p.settings.models = vec!["gpt-5.4".into()];
+    p.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: Some(probe_server.uri()),
+            proxy_pool: None,
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    let ticket = format!("gAAAAA{}", "w".repeat(286));
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-codex-turn-state", ticket.as_str()),
+        )
+        .mount(&probe_server)
+        .await;
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-5.4".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .matched
+    );
+    let expected = ticket.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let header_ticket = expected.clone();
+        let mut ws =
+            crate::transport::accept_codex_test_websocket_with(socket, move |req, _response| {
+                assert_eq!(
+                    req.headers().get("x-codex-turn-state").unwrap(),
+                    header_ticket.as_str()
+                );
+            })
+            .await;
+        let message = ws.next().await.unwrap().unwrap();
+        let body: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+        assert_eq!(body["client_metadata"]["x-codex-turn-state"], expected);
+        assert_eq!(body["client_metadata"]["custom"], "keep");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(json!({"type":"response.completed","response":{"id":"resp_ticket_ws","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}).to_string().into())).await.unwrap();
+    });
+    let payload=ProtocolPayload::json_object("openai",json!({"model":"gpt-5.4","input":[],"client_metadata":{"x-codex-turn-state":"stale-body","custom":"keep"}}).as_object().unwrap().clone()).unwrap()
+        .with_context(Map::from_iter([("use_websocket".into(),json!(true)),("opaque_request_headers".into(),json!([["x-codex-turn-state",base64::engine::general_purpose::STANDARD.encode("stale-header")]]))]));
+    let generate = GenerateRequest::from_protocol_payload(payload).with_provider_session_state(
+        gateway_core::operation::ProviderSessionState::new(
+            "openai",
+            json!({"account_id":"acct_ticket_a","continuation_scope":"persisted"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap(),
+    );
+    let mut stream = bundle
+        .core_provider()
+        .execute(
+            initialized_provider_request(Operation::Generate(generate), "acct_ticket_a"),
+            initialized_attempt_context("req_ticket_ws_override", "acct_ticket_a"),
+        )
+        .await
+        .unwrap();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ticket_continuous_dispatches_three_requests_for_selected_proxy() {
+    use gateway_admin::model::tickets::TicketProxyInput;
+    let (_config, _store, server, mut bundle) = setup().await;
+    let other = MockServer::start().await;
+    let admin = bundle.admin_provider();
+    let mut p = admin.ticket_panel().await.unwrap();
+    p.settings.enabled = true;
+    p.settings.manual_interval_seconds = 60;
+    p.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    let p = admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: None,
+            proxy_pool: None,
+            proxies: Some(vec![
+                TicketProxyInput {
+                    id: None,
+                    name: "selected".into(),
+                    url: Some(server.uri()),
+                    saved_proxy_id: None,
+                    enabled: Some(true),
+                    concurrency: Some(3),
+                },
+                TicketProxyInput {
+                    id: None,
+                    name: "other".into(),
+                    url: Some(other.uri()),
+                    saved_proxy_id: None,
+                    enabled: Some(true),
+                    concurrency: Some(3),
+                },
+            ]),
+        })
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", format!("gAAAAA{}", "a".repeat(286)))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&other)
+        .await;
+    let mut start = continuous_input(Some(10));
+    start.proxy_id = Some("0".into());
+    start.revision = Some(p.revision);
+    admin.continuous_ticket(start).await.unwrap();
+    let (task, context) = ticket_task(&mut bundle);
+    let cycle = task.run_cycle(context.clone());
+    tokio::pin!(cycle);
+    tokio::select! { _=&mut cycle=>panic!("batch finished before concurrent observation"),()=tokio::time::sleep(Duration::from_millis(120))=>{} }
+    let live = admin.ticket_panel().await.unwrap();
+    assert_eq!(live.proxies[0].in_flight, 3);
+    assert_eq!(live.proxies[1].in_flight, 0);
+    cycle.await.unwrap();
+    let p = admin.ticket_panel().await.unwrap();
+    assert_eq!(p.logs.len(), 3);
+    assert!(p.logs.iter().all(|l| l.continuous && l.result.matched));
+    assert!(
+        p.accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .continuous
+            .is_none()
+    );
+    task.run_cycle(context).await.unwrap();
     assert_eq!(admin.ticket_panel().await.unwrap().logs.len(), 3);
 }
 

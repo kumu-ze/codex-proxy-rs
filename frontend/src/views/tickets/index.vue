@@ -13,6 +13,7 @@ import BaseInput from '@/components/base/BaseInput.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
+import BaseTag from '@/components/base/BaseTag.vue'
 import { toast } from '@/components/base/BaseToast'
 import { useUiClock } from '@/composables/useUiClock'
 
@@ -410,9 +411,12 @@ useEventListener(document, 'visibilitychange', () => {
               </div>
             </div>
             <div class="mt-4 grid gap-3 lg:grid-cols-2">
-              <div v-for="status in account.models" :key="status.model" class="rounded-lg bg-cp-bg-container p-4">
+              <div v-for="status in account.models" :key="status.model" class="rounded-lg p-4" :class="status.ready ? 'bg-cp-success-container' : 'bg-cp-bg-container'">
                 <div class="flex flex-wrap items-center justify-between gap-2">
-                  <span class="font-mono text-sm">{{ status.model }}</span><span :class="status.ready ? 'text-cp-success-text' : 'text-cp-text-secondary'">{{ status.ready ? '有效' : '暂无有效票' }}</span>
+                  <span class="font-mono text-sm">{{ status.model }}</span>
+                  <BaseTag :type="status.ready ? 'success' : 'neutral'" round>
+                    {{ status.ready ? '✓ 已打到 · 有效票' : '暂无有效票' }}
+                  </BaseTag>
                 </div>
                 <p class="mt-2 text-sm text-cp-text-secondary">
                   最近：{{ status.lastResult ? `HTTP ${status.lastResult.httpStatus} / 长度 ${status.lastResult.length}` : '尚未探测' }}
@@ -425,7 +429,7 @@ useEventListener(document, 'visibilitychange', () => {
                   <BaseInput :model-value="status.continuous?.intervalSeconds.toString() ?? continuousIntervals[`${account.id}/${status.model}`] ?? '10'" :disabled="!!status.continuous" :aria-label="`${account.name} ${status.model} 持续间隔（秒）`" type="number" min="10" max="86400" class="w-28" @update:model-value="continuousIntervals[`${account.id}/${status.model}`] = String($event)" />
                 </div>
                 <p class="mt-1 text-xs text-cp-text-secondary">
-                  持续间隔（秒），默认 10；每次完成后等待，命中自动停止。
+                  持续间隔（秒），默认 10；每轮按入口并发设置同时发起，完成后等待，命中自动停止。
                 </p>
                 <div class="mt-3 flex flex-wrap gap-2">
                   <BaseButton :disabled="!!probing || saving || !!controlling || !!status.continuous || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
@@ -531,7 +535,7 @@ useEventListener(document, 'visibilitychange', () => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="log in visibleLogs" :key="log.id" class="odd:bg-cp-fill-quaternary">
+              <tr v-for="log in visibleLogs" :key="log.id" :class="log.result.matched ? 'bg-cp-success-container/50' : 'odd:bg-cp-fill-quaternary'">
                 <td class="p-3 align-top">
                   {{ time(log.startedAt) }}<div class="mt-1 text-cp-text-secondary">
                     {{ log.trigger === 'auto' ? '自动' : log.continuous ? '手动持续' : '手动单次' }}
@@ -556,7 +560,9 @@ useEventListener(document, 'visibilitychange', () => {
                   </div>
                 </td>
                 <td class="p-3 align-top">
-                  <span :class="log.result.matched ? 'text-cp-success-text' : 'text-cp-warning-text'">{{ log.result.matched ? '已命中' : '未命中' }}</span><div class="mt-1">
+                  <BaseTag :type="log.result.matched ? 'success' : 'warning'" round>
+                    {{ log.result.matched ? '✓ 已命中' : '未命中' }}
+                  </BaseTag><div class="mt-1">
                     {{ log.durationMs }} ms
                   </div>
                 </td>
