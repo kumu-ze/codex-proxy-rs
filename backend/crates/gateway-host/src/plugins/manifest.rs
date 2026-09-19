@@ -57,8 +57,11 @@ impl PluginPackage {
             || manifest.files.is_empty()
             || manifest.files.len() > 256
             || !manifest.files.contains_key(&manifest.executable)
-            || manifest.capabilities.iter().any(|c| c != "request.openai")
-            || manifest.capabilities.len() > 1
+            || manifest
+                .capabilities
+                .iter()
+                .any(|c| c != "request.openai" && c != "provider.openai")
+            || manifest.capabilities.len() > 2
         {
             return Err(PluginError::InvalidPackage);
         }

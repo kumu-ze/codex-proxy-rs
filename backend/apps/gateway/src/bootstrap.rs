@@ -84,6 +84,7 @@ pub async fn run() -> Result<(), BootstrapError> {
     )
     .await?;
     host.report_startup_ready("OpenAI Provider");
+    plugins.attach_provider_services(openai.extension_services(), store.admin_ports().proxies())?;
     let mut xai = provider_xai::initialize(provider_ports).await?;
     host.report_startup_ready("xAI Provider");
     let providers = ProviderRegistry::new([openai.core_provider(), xai.core_provider()])?;

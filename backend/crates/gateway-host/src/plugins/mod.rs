@@ -4,6 +4,7 @@ mod install;
 mod manifest;
 mod process;
 mod registry;
+mod services;
 
 pub use install::install_package;
 pub use manifest::{PluginManifest, PluginPackage};

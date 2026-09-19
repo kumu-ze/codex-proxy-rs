@@ -1,6 +1,6 @@
 # 外部进程插件（实验实现）
 
-当前实现为插件框架原型，包含安装、进程管理、管理员接口、隔离页面和初步请求扩展，尚未完成 Turn-State 插件抽取。
+当前实现为插件框架原型，包含安装、进程管理、管理员接口、隔离页面和初步请求扩展，Turn-State 业务已独立提取。
 接口尚未冻结，不应直接替换生产版本。
 
 ## 安装与启用
@@ -38,7 +38,7 @@ plugins:
 ## 通信
 
 stdin/stdout 仅传输协议帧，禁止在 stdout 输出日志。每帧由 4 字节大端长度和 UTF-8 JSON 组成，最大 1 MiB。
-宿主发送 JSON-RPC 2.0 请求，插件回复相同 ID 的 result。当前不支持插件主动回调宿主。
+宿主发送 JSON-RPC 2.0 请求，插件回复相同 ID 的 result。Provider 服务能力通过独立回环入口提供。
 
 首次调用 `initialize`，参数为 `{ "apiVersion": 1, "pluginId": "example" }`；插件应原样返回此对象。
 握手限时 5 秒。进程不继承宿主环境，只显式传入 `RS_PLUGIN_DATA_DIR`；原生插件不得依赖 PATH 查找解释器。
@@ -85,6 +85,14 @@ credentialScope 由 Provider 按账号和认证材料计算；OAuth 同时绑定
 
 - 原生程序信任、平台兼容和权限声明的完整安装合同。
 - 持久化启停、审计、健康探测及有界退出监督。
-- Provider 作用域、探测能力、请求前扩展及 HTTP/WS 一致行为。
-- Turn-State 插件抽取、旧数据导入、性能对比和端到端回滚测试。
+- 大规模账号目录和并发压力下的性能验收。
+- 生产环境迁移、性能对比和端到端回滚验收。
 
+
+## Provider 服务能力
+
+完整插件可声明 `provider.openai`。宿主为该插件建立独立回环 HTTP 入口，并通过环境传入 RS_PLUGIN_SERVICES_URL 和 RS_PLUGIN_SERVICES_TOKEN。入口要求随机令牌，限制请求体 64 KiB、并发 16、单次 30 秒；管理员 iframe 不获得令牌。
+
+方法包括 accounts.list/get（账号快照及不可逆身份摘要）、responses.probe（固定 Provider Responses 目标及固定诊断正文，仅返回状态、状态头及退避信息）、network.exit（同源出口采样）、proxies.list/resolve（脱敏列表及供插件持久化的代理地址）。OAuth 认证材料不离开 Provider。该能力授权受信插件访问宿主账号及代理资源，安装前应核对程序来源。
+
+插件后台探测通过此独立入口运行，避免长期占用请求状态 RPC。业务规则、目标长度、重试调度、日志和票持久化均由独立插件实现。

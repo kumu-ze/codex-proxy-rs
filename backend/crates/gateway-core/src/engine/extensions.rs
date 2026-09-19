@@ -37,3 +37,13 @@ pub trait RequestExtension: Send + Sync {
         request: ExtensionRequest,
     ) -> Result<ExtensionDecision, ExtensionUnavailable>;
 }
+
+/// 插件调用 Provider 的受限能力。认证、目标地址和响应过滤仍由 Provider 拥有。
+#[async_trait]
+pub trait ExtensionServices: Send + Sync {
+    async fn invoke(
+        &self,
+        method: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, ExtensionUnavailable>;
+}

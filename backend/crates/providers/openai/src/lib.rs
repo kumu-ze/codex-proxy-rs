@@ -2,6 +2,7 @@
 
 mod admin;
 pub mod config;
+mod extension_services;
 mod provider;
 mod session_transport;
 
@@ -44,6 +45,7 @@ pub use transport::{
 
 /// OpenAI 初始化后交给组装根的最小能力集。
 pub struct ProviderBundle {
+    extension_services: Arc<dyn gateway_core::engine::extensions::ExtensionServices>,
     core_provider: Arc<dyn Provider>,
     admin_provider: Arc<dyn ProviderAdmin>,
     worker_contributions: Vec<WorkerContribution>,
@@ -138,6 +140,11 @@ pub async fn initialize_with_extension(
     );
     platform_releases.restore().await;
     let repository = CodexCredentialRepository::new(Arc::clone(&accounts));
+    let extension_services = extension_services::OpenAiExtensionServices::new(
+        repository.clone(),
+        profile.clone(),
+        config.base_url(),
+    );
     let websocket_pool = Arc::new(CodexWebSocketPool::with_config(
         config.websocket_pool_config(),
     ));
@@ -256,6 +263,7 @@ pub async fn initialize_with_extension(
     .map_err(|_| OpenAiInitializeError::Worker)?;
 
     Ok(ProviderBundle {
+        extension_services,
         core_provider,
         admin_provider,
         worker_contributions,
@@ -263,6 +271,11 @@ pub async fn initialize_with_extension(
 }
 
 impl ProviderBundle {
+    pub fn extension_services(
+        &self,
+    ) -> Arc<dyn gateway_core::engine::extensions::ExtensionServices> {
+        self.extension_services.clone()
+    }
     #[must_use]
     pub fn core_provider(&self) -> Arc<dyn Provider> {
         Arc::clone(&self.core_provider)

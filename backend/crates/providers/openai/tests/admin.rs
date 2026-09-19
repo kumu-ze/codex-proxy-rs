@@ -2416,3 +2416,129 @@ async fn extension_state_is_applied_after_account_scoping() {
         "extension-state"
     );
 }
+#[tokio::test]
+async fn extension_services_filter_credentials_and_reject_stale_scope() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_services".into(),
+            name: "Fixture".into(),
+            secret: secret("private-fixture-token"),
+            verified_account: profile("upstream-fixture"),
+            next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+            enabled: true,
+        })
+        .await;
+    let proxy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer private-fixture-token",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-codex-turn-state", "fixture-state"),
+        )
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    let mut config = valid_config();
+    config.config.api.base_url = "http://upstream.invalid".into();
+    let bundle = provider_openai::initialize(
+        config.config,
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let services = bundle.extension_services();
+    let accounts = services.invoke("accounts.list", json!({})).await.unwrap();
+    assert!(!accounts.to_string().contains("private-fixture-token"));
+    let binding = accounts[0]["binding"].as_str().unwrap();
+    let mut input = json!({"accountId":"acct_services","credentialScope":binding,"model":"gpt-5.4","proxy":proxy.uri()});
+    let result = services
+        .invoke("responses.probe", input.clone())
+        .await
+        .unwrap();
+    assert_eq!(result[0], 200);
+    assert_eq!(result[1], "fixture-state");
+    input["credentialScope"] = "stale".into();
+    assert!(services.invoke("responses.probe", input).await.is_err());
+    assert!(
+        services
+            .invoke("arbitrary.fetch", json!({"url":"http://example.test"}))
+            .await
+            .is_err()
+    );
+}
+#[tokio::test]
+async fn extension_state_reaches_websocket_handshake_and_frame() {
+    use futures::SinkExt as _;
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_extension".into(),
+            name: "Fixture".into(),
+            secret: secret("at-extension-secret"),
+            verified_account: profile("upstream-fixture"),
+            next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+            enabled: true,
+        })
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws =
+            crate::transport::accept_codex_test_websocket_with(socket, |request, _response| {
+                assert_eq!(
+                    request.headers().get("x-codex-turn-state").unwrap(),
+                    "extension-state"
+                );
+            })
+            .await;
+        let message = ws.next().await.unwrap().unwrap();
+        let body: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+        assert_eq!(
+            body["client_metadata"]["x-codex-turn-state"],
+            "extension-state"
+        );
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(json!({"type":"response.completed","response":{"id":"resp_extension_ws","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}).to_string().into())).await.unwrap();
+    });
+    let mut config = valid_config();
+    config.config.api.base_url = format!("http://{address}");
+    let bundle = provider_openai::initialize_with_extension(
+        config.config,
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+        Some(Arc::new(TestRequestExtension)),
+    )
+    .await
+    .unwrap();
+    let payload = ProtocolPayload::json_object(
+        "openai",
+        json!({"model":"gpt-5.4","input":"hello","client_metadata":{"x-codex-turn-state":"old"}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .unwrap()
+    .with_context(Map::from_iter([("use_websocket".into(), json!(true))]));
+    let mut stream = bundle
+        .core_provider()
+        .execute(
+            initialized_provider_request(
+                Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                "acct_extension",
+            ),
+            initialized_attempt_context("req_extension_ws", "acct_extension"),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        server.await.unwrap();
+    })
+    .await
+    .unwrap();
+}

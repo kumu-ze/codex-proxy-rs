@@ -4,6 +4,8 @@ mod manifest;
 mod process;
 #[cfg(unix)]
 mod registry;
+#[cfg(unix)]
+mod services;
 
 fn package(script: &[u8]) -> tempfile::TempDir {
     use sha2::{Digest as _, Sha256};

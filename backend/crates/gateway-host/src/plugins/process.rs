@@ -27,17 +27,31 @@ impl PluginProcess {
         data_directory: &Path,
         deadline: Duration,
     ) -> Result<Self, PluginError> {
+        Self::start_with_services(package, data_directory, deadline, None).await
+    }
+
+    pub(super) async fn start_with_services(
+        package: &PluginPackage,
+        data_directory: &Path,
+        deadline: Duration,
+        services: Option<&super::services::ServiceEndpoint>,
+    ) -> Result<Self, PluginError> {
         let data_directory = data_directory.canonicalize().map_err(|_| PluginError::Io)?;
-        let mut child = Command::new(package.executable())
+        let mut command = Command::new(package.executable());
+        command
             .current_dir(package.root())
             .env_clear()
             .env("RS_PLUGIN_DATA_DIR", data_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| PluginError::Io)?;
+            .kill_on_drop(true);
+        if let Some(services) = services {
+            command
+                .env("RS_PLUGIN_SERVICES_URL", &services.url)
+                .env("RS_PLUGIN_SERVICES_TOKEN", &services.token);
+        }
+        let mut child = command.spawn().map_err(|_| PluginError::Io)?;
         let input = child.stdin.take().ok_or(PluginError::Io)?;
         let output = child.stdout.take().ok_or(PluginError::Io)?;
         let mut process = Self {

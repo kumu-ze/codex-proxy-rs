@@ -42,6 +42,7 @@ impl PluginConfig {
 }
 
 struct Entry {
+    _services: Option<super::services::ServiceEndpoint>,
     admission: Semaphore,
     request_openai: bool,
     version: String,
@@ -52,6 +53,8 @@ struct Entry {
 /// 插件列表在启动时冻结；单个进程失效不影响其他插件或宿主。
 pub struct PluginRegistry {
     entries: BTreeMap<String, Entry>,
+    services:
+        Arc<std::sync::OnceLock<Arc<dyn gateway_core::engine::extensions::ExtensionServices>>>,
 }
 
 impl PluginRegistry {
@@ -88,12 +91,30 @@ impl PluginRegistry {
                 }
             }
         }
+        let services = Arc::new(std::sync::OnceLock::new());
         let mut entries = BTreeMap::new();
         for (package, data) in prepared {
-            let process = PluginProcess::start(&package, &data, Duration::from_secs(5)).await?;
+            let endpoint = if package
+                .manifest()
+                .capabilities
+                .iter()
+                .any(|c| c == "provider.openai")
+            {
+                Some(super::services::ServiceEndpoint::start(services.clone()).await?)
+            } else {
+                None
+            };
+            let process = PluginProcess::start_with_services(
+                &package,
+                &data,
+                Duration::from_secs(5),
+                endpoint.as_ref(),
+            )
+            .await?;
             entries.insert(
                 package.manifest().id.clone(),
                 Entry {
+                    _services: endpoint,
                     admission: Semaphore::new(16),
                     request_openai: package
                         .manifest()
@@ -106,7 +127,26 @@ impl PluginRegistry {
                 },
             );
         }
-        Ok(Arc::new(Self { entries }))
+        Ok(Arc::new(Self { entries, services }))
+    }
+
+    pub fn attach_services(
+        &self,
+        services: Arc<dyn gateway_core::engine::extensions::ExtensionServices>,
+    ) -> Result<(), PluginError> {
+        self.services
+            .set(services)
+            .map_err(|_| PluginError::InvalidPackage)
+    }
+    pub fn attach_provider_services(
+        &self,
+        provider: Arc<dyn gateway_core::engine::extensions::ExtensionServices>,
+        proxies: Arc<dyn gateway_admin::ports::proxy::ProxyStore>,
+    ) -> Result<(), PluginError> {
+        self.attach_services(Arc::new(super::services::ProviderServices {
+            provider,
+            proxies,
+        }))
     }
 
     pub async fn shutdown(&self) {
