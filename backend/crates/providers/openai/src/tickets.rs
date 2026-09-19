@@ -11,6 +11,7 @@ use gateway_admin::{
 };
 use gateway_core::{
     account::{CredentialState, ProviderAccount, ProviderAccountId},
+    lifecycle::CancellationToken,
     task::{ScheduledTask, WorkerCycleContext, WorkerTaskError},
 };
 use secrecy::ExposeSecret;
@@ -84,6 +85,16 @@ struct Observations {
     proxy_busy: BTreeMap<String, usize>,
     proxy_cursor: usize,
     worker_checked_at: Option<u64>,
+    continuous: BTreeMap<(String, String), ContinuousProbe>,
+}
+
+#[derive(Clone)]
+struct ContinuousProbe {
+    id: uuid::Uuid,
+    interval_seconds: u64,
+    next_probe_at: u64,
+    proxy: Option<String>,
+    cancellation: CancellationToken,
 }
 
 impl Observations {
@@ -269,8 +280,19 @@ impl TicketService {
             .await
             .map_err(|_| error(ProviderAdminErrorKind::Unavailable))?;
         let mut bindings = BTreeMap::new();
+        // 没有待复用票的账号无需为每次页面轮询读取、解密凭据。
+        let ticket_accounts: std::collections::BTreeSet<_> = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tickets
+            .iter()
+            .filter(|t| t.expires_at > now())
+            .map(|t| t.account_id.clone())
+            .collect();
         for account in &accounts {
-            if eligible(account)
+            if ticket_accounts.contains(account.id().as_str())
+                && eligible(account)
                 && let Ok(credential) = self.repository.load_runtime_credential(account).await
                 && let Some(binding) = auth_binding(account, &credential.authentication)
             {
@@ -324,6 +346,26 @@ impl TicketService {
                                     d.settings.manual_interval_seconds,
                                     true,
                                 ),
+                                continuous: o.continuous.get(&key).map(|run| {
+                                    TicketContinuousStatus {
+                                        interval_seconds: run.interval_seconds,
+                                        next_probe_at: run.next_probe_at.max(
+                                            o.retry_at(
+                                                id,
+                                                d.settings.manual_interval_seconds,
+                                                true,
+                                            )
+                                            .unwrap_or(0),
+                                        ),
+                                        proxy_id: run
+                                            .proxy
+                                            .as_ref()
+                                            .and_then(|proxy| {
+                                                d.proxy_pool.iter().position(|p| p == proxy)
+                                            })
+                                            .map(|i| i.to_string()),
+                                    }
+                                }),
                             }
                         })
                         .collect(),
@@ -455,10 +497,7 @@ impl TicketService {
         if next.revision != update.revision {
             return Err(error(ProviderAdminErrorKind::Conflict));
         }
-        next.revision = next
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| error(ProviderAdminErrorKind::Conflict))?;
+        let previous = next.clone();
         let old_settings = next.settings.clone();
         next.settings = update.settings;
         if let Some(entries) = update.proxies {
@@ -533,6 +572,20 @@ impl TicketService {
             return Err(error(ProviderAdminErrorKind::Invalid)
                 .with_public_message("启用打标需要先配置代理池；清除代理池前请关闭打标"));
         }
+        // 无改动保存不落盘、不推进 revision，也不会使在途的有效结果失效。
+        if next.settings == previous.settings
+            && next.proxy_pool == previous.proxy_pool
+            && next.proxy_names == previous.proxy_names
+            && next.proxy_enabled == previous.proxy_enabled
+            && next.proxy_concurrency == previous.proxy_concurrency
+        {
+            drop(guard);
+            return self.panel().await;
+        }
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error(ProviderAdminErrorKind::Conflict))?;
         // 间隔、代理名称及手动/自动切换不改变已获票的身份和有效期。
         // 只淘汰被关闭、移除、目标长度不符或过期的票；缩短 TTL 只能收紧已有期限。
         next.tickets.retain_mut(|ticket| {
@@ -602,6 +655,149 @@ impl TicketService {
             .map(|t| t.state.clone())
     }
 
+    pub(crate) async fn continuous(
+        &self,
+        input: TicketContinuousInput,
+    ) -> Result<TicketPanel, ProviderAdminError> {
+        let key = (input.account_id.clone(), input.model.clone());
+        let Some(interval) = input.interval_seconds else {
+            if let Some(run) = self
+                .observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .continuous
+                .remove(&key)
+            {
+                run.cancellation.cancel();
+            }
+            return self.panel().await;
+        };
+        if !(10..=86400).contains(&interval) {
+            return Err(error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("持续打标间隔应为 10–86400 秒"));
+        }
+        let panel = self.panel().await?;
+        let account = panel
+            .accounts
+            .iter()
+            .find(|a| a.id == input.account_id && a.eligible && a.policy.mode != TicketMode::Off)
+            .ok_or_else(|| error(ProviderAdminErrorKind::Invalid))?;
+        let model = account
+            .models
+            .iter()
+            .find(|m| m.model == input.model)
+            .ok_or_else(|| error(ProviderAdminErrorKind::Invalid))?;
+        {
+            let d = self
+                .data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !d.settings.enabled
+                || !d.settings.proxy_pool_enabled
+                || !(0..d.proxy_pool.len()).any(|i| d.proxy_enabled.get(i).copied().unwrap_or(true))
+            {
+                return Err(error(ProviderAdminErrorKind::Invalid)
+                    .with_public_message("请先启用打标及可用代理"));
+            }
+            if panel.revision != d.revision || input.revision.is_some_and(|r| r != d.revision) {
+                return Err(error(ProviderAdminErrorKind::Conflict));
+            }
+            let proxy = if let Some(id) = input.proxy_id.as_deref() {
+                if input.revision != Some(d.revision) {
+                    return Err(error(ProviderAdminErrorKind::Conflict));
+                }
+                let i = id
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|i| {
+                        *i < d.proxy_pool.len() && d.proxy_enabled.get(*i).copied().unwrap_or(true)
+                    })
+                    .ok_or_else(|| {
+                        error(ProviderAdminErrorKind::Invalid).with_public_message("指定代理不可用")
+                    })?;
+                Some(d.proxy_pool[i].clone())
+            } else {
+                None
+            };
+            let mut o = self
+                .observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if o.continuous.contains_key(&key) {
+                return Err(error(ProviderAdminErrorKind::Conflict)
+                    .with_public_message("持续打标已在运行，请先停止"));
+            }
+            if !model.ready {
+                if o.continuous.len() >= MAX_PROBE_CONCURRENCY {
+                    return Err(error(ProviderAdminErrorKind::Conflict));
+                }
+                o.continuous.insert(
+                    key,
+                    ContinuousProbe {
+                        id: uuid::Uuid::new_v4(),
+                        interval_seconds: interval,
+                        next_probe_at: now(),
+                        proxy,
+                        cancellation: CancellationToken::new(),
+                    },
+                );
+            }
+        }
+        self.panel().await
+    }
+
+    async fn run_continuous(&self, context: &WorkerCycleContext) -> Result<(), ProviderAdminError> {
+        let runs = self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .continuous
+            .clone();
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let panel = self.panel().await?;
+        let jobs = runs.into_iter().map(|(key, run)| {
+            let panel = &panel;
+            async move {
+                let model = panel.accounts.iter().find(|a| a.id == key.0 && a.eligible && a.policy.mode != TicketMode::Off)
+                    .and_then(|a| a.models.iter().find(|m| m.model == key.1));
+                let (revision, proxy_id, proxy_available) = {
+                    let d = self.data.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let index = run.proxy.as_ref().and_then(|proxy| d.proxy_pool.iter().position(|p| p == proxy));
+                    let available = index.map_or_else(
+                        || run.proxy.is_none() && (0..d.proxy_pool.len()).any(|i| d.proxy_enabled.get(i).copied().unwrap_or(true)),
+                        |i| d.proxy_enabled.get(i).copied().unwrap_or(true));
+                    (d.revision, index.map(|i| i.to_string()), available)
+                };
+                let stop = !panel.settings.enabled || !panel.settings.proxy_pool_enabled || !proxy_available || model.is_none_or(|m| m.ready);
+                if !stop && (run.next_probe_at > now() || model.is_some_and(|m| m.busy || m.manual_retry_at.is_some_and(|t| t > now()))) { return; }
+                let outcome = if stop { None } else {
+                    tokio::select! {
+                        () = context.cancellation().cancelled() => return,
+                        () = run.cancellation.cancelled() => return,
+                        result = self.probe(TicketProbe { account_id: key.0.clone(), model: key.1.clone(), proxy_id, revision: Some(revision) }) => Some(result),
+                    }
+                };
+                let mut o = self.observations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !o.continuous.get(&key).is_some_and(|active| active.id == run.id) { return; }
+                let done = match &outcome {
+                    None => true,
+                    Some(Ok(result)) => result.matched,
+                    Some(Err(e)) => matches!(e.kind(), ProviderAdminErrorKind::Invalid | ProviderAdminErrorKind::Internal),
+                };
+                if done {
+                    if let Some(active) = o.continuous.remove(&key) { active.cancellation.cancel(); }
+                } else if let Some(active) = o.continuous.get_mut(&key) {
+                    let delay = match outcome { Some(Ok(ref r)) if r.http_status == 0 => 60, Some(Err(_)) => 10, _ => 0 };
+                    active.next_probe_at = now().saturating_add(active.interval_seconds.max(delay));
+                }
+            }
+        });
+        futures::future::join_all(jobs).await;
+        Ok(())
+    }
+
     pub(crate) async fn probe(
         &self,
         input: TicketProbe,
@@ -642,6 +838,24 @@ impl TicketService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        if input.revision.is_some_and(|r| r != snapshot.revision) {
+            return Err(error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("代理或策略已变化，请刷新后重试"));
+        }
+        let forced_proxy = if let Some(id) = input.proxy_id.as_deref() {
+            if input.revision != Some(snapshot.revision) {
+                return Err(error(ProviderAdminErrorKind::Conflict)
+                    .with_public_message("指定代理需要当前策略版本，请刷新后重试"));
+            }
+            Some(
+                id.parse::<usize>()
+                    .ok()
+                    .filter(|i| *i < snapshot.proxy_pool.len())
+                    .ok_or_else(|| error(ProviderAdminErrorKind::Invalid))?,
+            )
+        } else {
+            forced_proxy
+        };
         if !snapshot.settings.enabled
             || !snapshot.settings.proxy_pool_enabled
             || snapshot.proxy_pool.is_empty()
@@ -1052,6 +1266,28 @@ impl ScheduledTask for TicketTask {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .worker_checked_at = Some(now());
+            self.0
+                .run_continuous(&context)
+                .await
+                .map_err(|_| WorkerTaskError::safe("持续打标目录读取失败"))?;
+            // 仅手动且没有持续任务时不访问账号数据库；心跳仍可供页面判断 worker 是否存活。
+            let automatic_enabled = {
+                let d = self
+                    .0
+                    .data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                d.settings.enabled
+                    && d.settings.proxy_pool_enabled
+                    && !d.proxy_pool.is_empty()
+                    && d.settings
+                        .accounts
+                        .values()
+                        .any(|p| p.mode == TicketMode::Auto)
+            };
+            if !automatic_enabled {
+                return Ok(());
+            }
             let panel = self
                 .0
                 .panel()
@@ -1072,6 +1308,7 @@ impl ScheduledTask for TicketTask {
                         .iter()
                         .filter(|m| {
                             !m.busy
+                                && m.continuous.is_none()
                                 && m.retry_at.is_none()
                                 && m.expires_at.is_none_or(|t| {
                                     t <= now() + panel.settings.refresh_before_seconds
@@ -1080,6 +1317,7 @@ impl ScheduledTask for TicketTask {
                         .map(|m| TicketProbe {
                             account_id: a.id.clone(),
                             model: m.model.clone(),
+                            ..Default::default()
                         })
                 })
                 .collect();
@@ -1130,6 +1368,7 @@ impl ScheduledTask for TicketTask {
                     TicketProbe {
                         account_id: input.account_id.clone(),
                         model: input.model.clone(),
+                        ..Default::default()
                     },
                     true,
                     Some(index),

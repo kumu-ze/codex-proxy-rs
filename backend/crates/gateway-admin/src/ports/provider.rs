@@ -128,6 +128,14 @@ pub trait ProviderAdmin: Send + Sync {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }
 
+    /// 启动或停止管理员指定的持续打标任务。
+    async fn continuous_ticket(
+        &self,
+        _input: crate::model::tickets::TicketContinuousInput,
+    ) -> Result<crate::model::tickets::TicketPanel, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     /// 只读内置价目；没有本地计价能力的 Provider 返回空目录。
     fn pricing_catalog(&self) -> crate::model::pricing::ProviderPricingCatalog {
         Default::default()

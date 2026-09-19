@@ -33,7 +33,7 @@ export interface TicketAccount {
   eligible: boolean
   targetLength: number
   policy: TicketPolicy
-  models: { model: string, ready: boolean, expiresAt: number | null, lastResult: TicketResult | null, busy: boolean, retryAt: number | null, manualRetryAt: number | null }[]
+  models: { model: string, ready: boolean, expiresAt: number | null, lastResult: TicketResult | null, busy: boolean, retryAt: number | null, manualRetryAt: number | null, continuous: { intervalSeconds: number, nextProbeAt: number, proxyId: string | null } | null }[]
 }
 export interface TicketLog {
   id: string
@@ -65,11 +65,19 @@ export function saveTicketSettings(data: { revision: number, settings: TicketSet
     data,
   })
 }
-export function probeTicket(data: { accountId: string, model: string }) {
+export interface TicketProbeInput { accountId: string, model: string, proxyId?: string, revision?: number }
+export function probeTicket(data: TicketProbeInput) {
   return request<TicketResult>({
     url: '/api/admin/tickets/probe',
     method: 'POST',
     data,
     timeout: 35000,
+  })
+}
+export function continuousTicket(data: TicketProbeInput & { intervalSeconds: number | null }) {
+  return request<TicketPanel>({
+    url: '/api/admin/tickets/continuous',
+    method: 'POST',
+    data,
   })
 }

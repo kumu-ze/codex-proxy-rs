@@ -5,7 +5,7 @@ import { ChevronLeft, ChevronRight, Plus, Trash2 } from '@lucide/vue'
 import { useIntervalFn } from '@vueuse/core'
 import { computed, onMounted, ref, toRaw, watch } from 'vue'
 import { getProxies } from '@/api/modules/proxies'
-import { getTicketPanel, probeTicket, saveTicketSettings } from '@/api/modules/tickets'
+import { continuousTicket, getTicketPanel, probeTicket, saveTicketSettings } from '@/api/modules/tickets'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
@@ -23,6 +23,16 @@ let polling = false
 const loading = ref(false)
 const saving = ref(false)
 const probing = ref('')
+const controlling = ref('')
+const manualProxies = ref<Record<string, string>>({})
+const continuousIntervals = ref<Record<string, string>>({})
+const manualProxyOptions = computed(() => [
+  { label: '代理池轮换', value: 'pool' },
+  ...(panel.value?.proxies ?? []).map(p => ({ label: `${p.name}${p.enabled ? '' : '（已禁用）'}`, value: p.id, disabled: !p.enabled })),
+])
+watch(() => panel.value?.revision, () => {
+  manualProxies.value = {}
+})
 const proxy = ref('')
 const clearProxy = ref(false)
 const poolDraft = ref<(TicketProxyInput & { key: number, endpoint: string, hasAuthentication: boolean })[]>([])
@@ -187,7 +197,7 @@ async function probe(account: TicketAccount, model: string) {
   generation += 1
   probing.value = `${account.id}/${model}`
   try {
-    const result = await probeTicket({ accountId: account.id, model })
+    const result = await probeTicket(manualInput(account.id, model))
     if (result.matched)
       toast.success(`${account.name}：已匹配，长度 ${result.length}`)
     else toast.warning(`${account.name}：HTTP ${result.httpStatus}，长度 ${result.length}，${result.message}`)
@@ -200,9 +210,29 @@ async function probe(account: TicketAccount, model: string) {
 function time(value: number | null | undefined) {
   return value ? new Date(value * 1000).toLocaleString() : '—'
 }
+function manualInput(accountId: string, model: string) {
+  const proxyId = manualProxies.value[`${accountId}/${model}`] ?? 'pool'
+  return { accountId, model, proxyId: proxyId === 'pool' ? undefined : proxyId, revision: panel.value?.revision }
+}
+async function continuous(account: TicketAccount, model: string, stop = false) {
+  const key = `${account.id}/${model}`
+  const interval = Number(continuousIntervals.value[key] ?? '10')
+  if (!stop && (!Number.isInteger(interval) || interval < 10 || interval > 86400)) {
+    toast.warning('持续打标间隔应为 10–86400 秒')
+    return
+  }
+  generation += 1
+  controlling.value = key
+  try {
+    panel.value = await continuousTicket({ ...manualInput(account.id, model), intervalSeconds: stop ? null : interval })
+    toast.success(stop ? '持续打标已停止' : '已提交持续打标，命中后自动停止')
+  }
+  catch {}
+  finally { controlling.value = '' }
+}
 onMounted(load)
 useIntervalFn(async () => {
-  if (loading.value || saving.value || probing.value || !panel.value || polling)
+  if (loading.value || saving.value || probing.value || controlling.value || !panel.value || polling || document.hidden)
     return
   polling = true
   const started = generation
@@ -213,7 +243,7 @@ useIntervalFn(async () => {
   }
   catch {}
   finally { polling = false }
-}, 10000)
+}, computed(() => panel.value?.accounts.some(a => a.models.some(m => m.continuous)) ? 3000 : 10000))
 </script>
 
 <template>
@@ -314,7 +344,7 @@ useIntervalFn(async () => {
           <BaseInput v-model="search" aria-label="搜索账号" placeholder="搜索账号、套餐或 ID" class="w-full sm:w-72" />
         </div>
         <p class="mb-4 text-sm text-cp-text-secondary">
-          修改模式后先保存。自动模式也支持手动打一张；每次按钮只发送一个请求，限流会退避。刷新会放弃未保存草稿。
+          修改模式后先保存。手动探测可指定代理或从池内轮换；持续打标按间隔重复，命中即停，也可随时停止。限流会退避。刷新会放弃未保存草稿，持续任务继续运行。
           后台最近检查：{{ time(panel.workerCheckedAt) }}。
         </p>
         <p v-if="!rows.length" class="py-8 text-center text-cp-text-secondary">
@@ -346,9 +376,27 @@ useIntervalFn(async () => {
                 <p class="mt-1 text-xs text-cp-text-secondary">
                   到期：{{ time(status.expiresAt) }}<span v-if="status.manualRetryAt"> · 下次可手动探测：{{ time(status.manualRetryAt) }}</span>
                 </p>
-                <BaseButton class="mt-3" :disabled="!!probing || saving || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
-                  {{ probing === `${account.id}/${status.model}` || status.busy ? '探测中…' : '手动打一张' }}
-                </BaseButton>
+                <div class="mt-3 flex flex-wrap gap-3">
+                  <BaseSelect :model-value="status.continuous ? (status.continuous.proxyId ?? 'pool') : (manualProxies[`${account.id}/${status.model}`] ?? 'pool')" :options="manualProxyOptions" :disabled="!!status.continuous || status.busy" :aria-label="`${account.name} ${status.model} 手动代理`" class="min-w-40 flex-1" @update:model-value="manualProxies[`${account.id}/${status.model}`] = $event" />
+                  <BaseInput :model-value="status.continuous?.intervalSeconds.toString() ?? continuousIntervals[`${account.id}/${status.model}`] ?? '10'" :disabled="!!status.continuous" :aria-label="`${account.name} ${status.model} 持续间隔（秒）`" type="number" min="10" max="86400" class="w-28" @update:model-value="continuousIntervals[`${account.id}/${status.model}`] = String($event)" />
+                </div>
+                <p class="mt-1 text-xs text-cp-text-secondary">
+                  持续间隔（秒），默认 10；每次完成后等待，命中自动停止。
+                </p>
+                <div class="mt-3 flex flex-wrap gap-2">
+                  <BaseButton :disabled="!!probing || saving || !!controlling || !!status.continuous || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
+                    {{ probing === `${account.id}/${status.model}` || status.busy ? '探测中…' : '手动打一张' }}
+                  </BaseButton>
+                  <BaseButton v-if="status.continuous" :disabled="!!controlling" @click="continuous(account, status.model, true)">
+                    {{ controlling === `${account.id}/${status.model}` ? '停止中…' : '停止持续打标' }}
+                  </BaseButton>
+                  <BaseButton v-else variant="primary" :disabled="!!probing || saving || !!controlling || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || status.ready" @click="continuous(account, status.model)">
+                    持续打标
+                  </BaseButton>
+                </div>
+                <p v-if="status.continuous" role="status" class="mt-2 text-xs text-cp-text-secondary">
+                  {{ status.busy ? '持续打标正在探测…' : `持续打标等待中 · 下次检查 ${time(status.continuous.nextProbeAt)}` }}
+                </p>
               </div>
             </div>
           </article>

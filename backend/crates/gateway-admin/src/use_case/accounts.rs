@@ -64,6 +64,13 @@ pub trait AccountsService: Send + Sync {
     ) -> Result<crate::model::tickets::TicketResult, AdminError> {
         Err(AdminError::invalid("当前版本不支持打标管理"))
     }
+    async fn continuous_ticket(
+        &self,
+        _context: &MutationContext,
+        _input: crate::model::tickets::TicketContinuousInput,
+    ) -> Result<crate::model::tickets::TicketPanel, AdminError> {
+        Err(AdminError::invalid("当前版本不支持持续打标"))
+    }
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError>;
 
     async fn export(
@@ -741,6 +748,25 @@ impl AccountsService for DefaultAccountsService {
             .probe_ticket(probe)
             .await
             .map_err(|e| map_provider_error(e, "ticket probe"))
+    }
+
+    async fn continuous_ticket(
+        &self,
+        context: &MutationContext,
+        input: crate::model::tickets::TicketContinuousInput,
+    ) -> Result<crate::model::tickets::TicketPanel, AdminError> {
+        let kind =
+            ProviderKind::new("openai").map_err(|_| AdminError::internal("Provider 无效"))?;
+        let provider = self
+            .providers
+            .require(&kind)
+            .map_err(|e| map_provider_error(e, "ticket provider"))?;
+        tracing::info!(actor = ?context.actor, request_id = %context.request_id, account_id = %input.account_id,
+            running = input.interval_seconds.is_some(), "管理员调整持续打标");
+        provider
+            .continuous_ticket(input)
+            .await
+            .map_err(|e| map_provider_error(e, "continuous ticket"))
     }
 
     async fn account_configuration(

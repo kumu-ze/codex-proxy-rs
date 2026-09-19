@@ -157,6 +157,15 @@ pub struct TicketModelStatus {
     pub busy: bool,
     pub retry_at: Option<u64>,
     pub manual_retry_at: Option<u64>,
+    pub continuous: Option<TicketContinuousStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketContinuousStatus {
+    pub interval_seconds: u64,
+    pub next_probe_at: u64,
+    pub proxy_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,9 +220,21 @@ pub struct TicketProxyInput {
     pub concurrency: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TicketProbe {
     pub account_id: String,
     pub model: String,
+    pub proxy_id: Option<String>,
+    pub revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TicketContinuousInput {
+    pub account_id: String,
+    pub model: String,
+    pub interval_seconds: Option<u64>,
+    pub proxy_id: Option<String>,
+    pub revision: Option<u64>,
 }

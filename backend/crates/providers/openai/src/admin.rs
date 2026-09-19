@@ -199,6 +199,16 @@ impl ProviderAdmin for OpenAiAdminProvider {
             .probe(probe)
             .await
     }
+    async fn continuous_ticket(
+        &self,
+        input: gateway_admin::model::tickets::TicketContinuousInput,
+    ) -> Result<gateway_admin::model::tickets::TicketPanel, ProviderAdminError> {
+        self.tickets
+            .as_ref()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unsupported))?
+            .continuous(input)
+            .await
+    }
     fn pricing_catalog(&self) -> gateway_admin::model::pricing::ProviderPricingCatalog {
         crate::transport::usage::pricing_catalog()
     }

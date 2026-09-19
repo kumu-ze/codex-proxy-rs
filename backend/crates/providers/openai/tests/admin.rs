@@ -61,6 +61,43 @@ use crate::support::{
 
 use gateway_admin::model::tickets::{TicketAccountPolicy, TicketMode, TicketProbe, TicketUpdate};
 
+fn ticket_task(
+    bundle: &mut provider_openai::ProviderBundle,
+) -> (
+    Box<dyn gateway_core::task::ScheduledTask>,
+    gateway_core::task::WorkerCycleContext,
+) {
+    let registration = bundle
+        .take_worker_contributions()
+        .into_iter()
+        .find_map(|c| match c {
+            WorkerContribution::Registration(r) if r.id.owner() == "openai-turn-state-tickets" => {
+                Some(r)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let context = gateway_core::task::WorkerCycleContext::new(
+        registration.id,
+        None,
+        CancellationToken::new(),
+    );
+    let WorkerRunnable::Scheduled { task, .. } = registration.runnable else {
+        panic!("scheduled task")
+    };
+    (task, context)
+}
+
+fn continuous_input(interval: Option<u64>) -> gateway_admin::model::tickets::TicketContinuousInput {
+    gateway_admin::model::tickets::TicketContinuousInput {
+        account_id: "acct_ticket_a".into(),
+        model: "gpt-6-astra".into(),
+        interval_seconds: interval,
+        proxy_id: None,
+        revision: None,
+    }
+}
+
 async fn setup() -> (
     TestOpenAiConfig,
     Arc<MemoryAccountStore>,
@@ -90,6 +127,286 @@ async fn setup() -> (
     .await
     .unwrap();
     (config, store, server, bundle)
+}
+
+#[tokio::test]
+async fn ticket_selected_proxy_and_noop_save_preserve_inflight_result() {
+    let (_config, _store, first, bundle) = setup().await;
+    let second = MockServer::start().await;
+    let admin = bundle.admin_provider();
+    let mut p = admin.ticket_panel().await.unwrap();
+    p.settings.enabled = true;
+    p.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    let p = admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: None,
+            proxy_pool: Some(vec![first.uri(), second.uri()]),
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", format!("gAAAAA{}", "a".repeat(286)))
+                .set_delay(Duration::from_millis(200)),
+        )
+        .expect(1)
+        .mount(&second)
+        .await;
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-6-astra".into(),
+                proxy_id: Some("1".into()),
+                revision: None
+            })
+            .await
+            .is_err()
+    );
+    let probe = admin.probe_ticket(TicketProbe {
+        account_id: "acct_ticket_a".into(),
+        model: "gpt-6-astra".into(),
+        proxy_id: Some("1".into()),
+        revision: Some(p.revision),
+    });
+    tokio::pin!(probe);
+    tokio::select! { _ = &mut probe => panic!("probe finished early"), () = tokio::time::sleep(Duration::from_millis(50)) => {} }
+    let saved = admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: None,
+            proxy_pool: None,
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(saved.revision, p.revision);
+    assert!(probe.await.unwrap().matched);
+}
+
+#[tokio::test]
+async fn ticket_continuous_waits_retries_and_stops_on_match_without_restart_resume() {
+    let (config, store, server, mut bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let mut p = admin.ticket_panel().await.unwrap();
+    p.settings.enabled = true;
+    p.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: Some(server.uri()),
+            proxy_pool: None,
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        admin
+            .continuous_ticket(continuous_input(Some(1)))
+            .await
+            .is_err()
+    );
+    admin
+        .continuous_ticket(continuous_input(Some(10)))
+        .await
+        .unwrap();
+    assert!(
+        admin
+            .continuous_ticket(continuous_input(Some(10)))
+            .await
+            .is_err()
+    );
+    assert!(
+        admin
+            .ticket_panel()
+            .await
+            .unwrap()
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .continuous
+            .is_some()
+    );
+    let restored = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    assert!(
+        restored
+            .admin_provider()
+            .ticket_panel()
+            .await
+            .unwrap()
+            .accounts
+            .iter()
+            .all(|a| a.models.iter().all(|m| m.continuous.is_none()))
+    );
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", format!("gAAAAA{}", "a".repeat(306))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (task, context) = ticket_task(&mut bundle);
+    task.run_cycle(context.clone()).await.unwrap();
+    task.run_cycle(context.clone()).await.unwrap();
+    let p = admin.ticket_panel().await.unwrap();
+    assert_eq!(p.logs.len(), 1);
+    assert_eq!(p.logs[0].trigger, TicketMode::Manual);
+    assert!(
+        p.accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .continuous
+            .is_some()
+    );
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", format!("gAAAAA{}", "a".repeat(286))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    task.run_cycle(context.clone()).await.unwrap();
+    task.run_cycle(context).await.unwrap();
+    let p = admin.ticket_panel().await.unwrap();
+    let model = &p
+        .accounts
+        .iter()
+        .find(|a| a.id == "acct_ticket_a")
+        .unwrap()
+        .models[0];
+    assert!(model.ready);
+    assert!(model.continuous.is_none());
+    assert_eq!(p.logs.len(), 2);
+}
+
+#[tokio::test]
+async fn ticket_continuous_tracks_selected_proxy_across_reorder_and_stop_cancels() {
+    use gateway_admin::model::tickets::TicketProxyInput;
+    let (_config, _store, first, mut bundle) = setup().await;
+    let second = MockServer::start().await;
+    let admin = bundle.admin_provider();
+    let mut p = admin.ticket_panel().await.unwrap();
+    p.settings.enabled = true;
+    p.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    let p = admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: None,
+            proxy_pool: Some(vec![first.uri(), second.uri()]),
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    let mut start = continuous_input(Some(10));
+    start.proxy_id = Some("1".into());
+    start.revision = Some(p.revision);
+    admin.continuous_ticket(start).await.unwrap();
+    let p = admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: None,
+            proxy_pool: None,
+            proxies: Some(
+                [1, 0]
+                    .into_iter()
+                    .map(|i| TicketProxyInput {
+                        id: Some(i.to_string()),
+                        name: format!("proxy {i}"),
+                        url: None,
+                        saved_proxy_id: None,
+                        enabled: Some(true),
+                        concurrency: Some(1),
+                    })
+                    .collect(),
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        p.accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .continuous
+            .as_ref()
+            .unwrap()
+            .proxy_id
+            .as_deref(),
+        Some("0")
+    );
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+        .expect(1)
+        .mount(&second)
+        .await;
+    let (task, context) = ticket_task(&mut bundle);
+    let cycle = task.run_cycle(context.clone());
+    tokio::pin!(cycle);
+    tokio::select! {_=&mut cycle=>panic!("finished early"),()=tokio::time::sleep(Duration::from_millis(100))=>{}}
+    assert_eq!(admin.ticket_panel().await.unwrap().proxies[0].in_flight, 1);
+    admin
+        .continuous_ticket(continuous_input(None))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), cycle)
+        .await
+        .unwrap()
+        .unwrap();
+    task.run_cycle(context).await.unwrap();
+    let p = admin.ticket_panel().await.unwrap();
+    assert!(p.proxies.iter().all(|p| p.in_flight == 0));
+    assert!(p.logs.is_empty());
 }
 
 #[tokio::test]
@@ -138,6 +455,7 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
         .probe_ticket(TicketProbe {
             account_id: "acct_ticket_a".into(),
             model: "gpt-6-astra".into(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -149,7 +467,8 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
         admin
             .probe_ticket(TicketProbe {
                 account_id: "acct_ticket_b".into(),
-                model: "gpt-6-astra".into()
+                model: "gpt-6-astra".into(),
+                ..Default::default()
             })
             .await
             .is_err()
@@ -158,7 +477,8 @@ async fn ticket_probe_persists_redacts_and_rejects_disabled_account() {
         admin
             .probe_ticket(TicketProbe {
                 account_id: "acct_ticket_a".into(),
-                model: "gpt-5.6-sol".into()
+                model: "gpt-5.6-sol".into(),
+                ..Default::default()
             })
             .await
             .is_err()
@@ -251,6 +571,7 @@ async fn ticket_429_never_creates_a_ticket_and_stops_immediate_retries() {
         .probe_ticket(TicketProbe {
             account_id: "acct_ticket_a".into(),
             model: "gpt-5.6-sol".into(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -271,7 +592,8 @@ async fn ticket_429_never_creates_a_ticket_and_stops_immediate_retries() {
         admin
             .probe_ticket(TicketProbe {
                 account_id: "acct_ticket_a".into(),
-                model: "gpt-6-astra".into()
+                model: "gpt-6-astra".into(),
+                ..Default::default()
             })
             .await
             .is_err()
@@ -315,7 +637,8 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
         admin
             .probe_ticket(TicketProbe {
                 account_id: "acct_ticket_a".into(),
-                model: "gpt-5.4".into()
+                model: "gpt-5.4".into(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -418,7 +741,8 @@ async fn ticket_survives_mode_save_cookie_revision_and_reload_but_not_auth_rotat
         admin
             .probe_ticket(TicketProbe {
                 account_id: "acct_ticket_a".into(),
-                model: "gpt-5.4".into()
+                model: "gpt-5.4".into(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -698,7 +1022,8 @@ async fn ticket_pool_rotates_and_manual_zero_keeps_automatic_cooldown() {
             admin
                 .probe_ticket(TicketProbe {
                     account_id: "acct_ticket_a".into(),
-                    model: "gpt-6-astra".into()
+                    model: "gpt-6-astra".into(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
@@ -767,7 +1092,8 @@ async fn ticket_pool_rotates_and_manual_zero_keeps_automatic_cooldown() {
         admin
             .probe_ticket(TicketProbe {
                 account_id: "acct_ticket_a".into(),
-                model: "gpt-6-astra".into()
+                model: "gpt-6-astra".into(),
+                ..Default::default()
             })
             .await
             .is_err()
@@ -866,6 +1192,7 @@ async fn ticket_failed_connection_is_logged_without_credentials() {
         .probe_ticket(TicketProbe {
             account_id: "acct_ticket_a".into(),
             model: "gpt-6-astra".into(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -892,7 +1219,8 @@ async fn ticket_failed_connection_is_logged_without_credentials() {
         admin
             .probe_ticket(TicketProbe {
                 account_id: "acct_ticket_a".into(),
-                model: "gpt-6-astra".into()
+                model: "gpt-6-astra".into(),
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -1009,7 +1337,8 @@ async fn ticket_auto_uses_proxy_limits_skips_disabled_and_releases_completed_slo
         admin
             .probe_ticket(TicketProbe {
                 account_id: "acct_ticket_a".into(),
-                model: "gpt-6-astra".into()
+                model: "gpt-6-astra".into(),
+                ..Default::default()
             })
             .await
             .is_err()
