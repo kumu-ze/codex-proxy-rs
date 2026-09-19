@@ -6,6 +6,7 @@ export interface TicketPolicy { mode: TicketMode, targetLength: number | null }
 export interface TicketSettings {
   enabled: boolean
   inject: boolean
+  proxyPoolEnabled: boolean
   plusProLength: number
   businessLength: number
   defaultLength: number
@@ -46,9 +47,9 @@ export interface TicketLog {
   retryAt: number | null
   result: TicketResult
 }
-export interface TicketProxyInput { id?: string, name: string, url?: string, savedProxyId?: string }
-export interface TicketProxyView { id: string, name: string, endpoint: string, hasAuthentication: boolean }
-export interface TicketPanel { revision: number, settings: TicketSettings, proxyConfigured: boolean, proxyCount: number, proxies: TicketProxyView[], accounts: TicketAccount[], logs: TicketLog[], logLimit: number }
+export interface TicketProxyInput { id?: string, name: string, url?: string, savedProxyId?: string, enabled?: boolean, concurrency?: number }
+export interface TicketProxyView { id: string, name: string, endpoint: string, hasAuthentication: boolean, enabled: boolean, concurrency: number, inFlight: number }
+export interface TicketPanel { revision: number, settings: TicketSettings, proxyConfigured: boolean, proxyCount: number, proxies: TicketProxyView[], accounts: TicketAccount[], logs: TicketLog[], logLimit: number, workerCheckedAt: number | null }
 
 export function getTicketPanel(options: RequestOptions = {}) {
   return request<TicketPanel>({

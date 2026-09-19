@@ -902,6 +902,122 @@ async fn ticket_failed_connection_is_logged_without_credentials() {
 }
 
 #[tokio::test]
+async fn ticket_auto_uses_proxy_limits_skips_disabled_and_releases_completed_slots() {
+    use gateway_admin::model::tickets::TicketProxyInput;
+    let (_config, _store, server, mut bundle) = setup().await;
+    let disabled = MockServer::start().await;
+    let admin = bundle.admin_provider();
+    let mut panel = admin.ticket_panel().await.unwrap();
+    panel.settings.enabled = true;
+    panel.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Auto,
+            target_length: Some(292),
+        },
+    );
+    let mut panel = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: None,
+            proxy_pool: None,
+            proxies: Some(vec![
+                TicketProxyInput {
+                    id: None,
+                    name: "active".into(),
+                    url: Some(server.uri()),
+                    saved_proxy_id: None,
+                    enabled: Some(true),
+                    concurrency: Some(3),
+                },
+                TicketProxyInput {
+                    id: None,
+                    name: "disabled".into(),
+                    url: Some(disabled.uri()),
+                    saved_proxy_id: None,
+                    enabled: Some(false),
+                    concurrency: Some(3),
+                },
+            ]),
+        })
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", format!("gAAAAA{}", "x".repeat(306)))
+                .set_delay(Duration::from_millis(500)),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&disabled)
+        .await;
+    let registration = bundle
+        .take_worker_contributions()
+        .into_iter()
+        .find_map(|c| match c {
+            WorkerContribution::Registration(r) if r.id.owner() == "openai-turn-state-tickets" => {
+                Some(r)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let context = gateway_core::task::WorkerCycleContext::new(
+        registration.id,
+        None,
+        CancellationToken::new(),
+    );
+    let WorkerRunnable::Scheduled { task, lease, .. } = registration.runnable else {
+        panic!("scheduled task");
+    };
+    assert!(lease.is_none());
+    let cycle = task.run_cycle(context.clone());
+    tokio::pin!(cycle);
+    tokio::select! {
+        r = &mut cycle => panic!("probe batch finished early: {r:?}"),
+        () = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    let running = admin.ticket_panel().await.unwrap();
+    assert_eq!(running.proxies[0].in_flight, 3);
+    assert_eq!(running.proxies[1].in_flight, 0);
+    assert!(running.worker_checked_at.is_some());
+    cycle.await.unwrap();
+    let after = admin.ticket_panel().await.unwrap();
+    assert_eq!(after.logs.len(), 3);
+    assert!(after.proxies.iter().all(|p| p.in_flight == 0));
+    panel.settings.proxy_pool_enabled = false;
+    let paused = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: None,
+            proxy_pool: None,
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    task.run_cycle(context).await.unwrap();
+    assert_eq!(paused.proxy_count, 2);
+    assert!(!paused.proxies[1].enabled);
+    assert_eq!(paused.proxies[0].concurrency, 3);
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-6-astra".into()
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(admin.ticket_panel().await.unwrap().logs.len(), 3);
+}
+
+#[tokio::test]
 async fn ticket_named_pool_preserves_credentials_on_rename_and_reorder() {
     use gateway_admin::model::tickets::TicketProxyInput;
     let (_config, _store, server, bundle) = setup().await;
@@ -922,6 +1038,8 @@ async fn ticket_named_pool_preserves_credentials_on_rename_and_reorder() {
                         .replacen("http://", "http://username:password@", 1),
                 ),
                 saved_proxy_id: None,
+                enabled: None,
+                concurrency: None,
             }]),
         })
         .await
@@ -940,6 +1058,8 @@ async fn ticket_named_pool_preserves_credentials_on_rename_and_reorder() {
                 name: "renamed".into(),
                 url: None,
                 saved_proxy_id: None,
+                enabled: None,
+                concurrency: None,
             }]),
         })
         .await

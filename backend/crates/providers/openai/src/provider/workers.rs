@@ -13,11 +13,16 @@ pub(crate) struct ClientReleaseServices {
 pub(crate) fn ticket_worker(
     service: Arc<crate::tickets::TicketService>,
 ) -> Result<WorkerContribution, WorkerDefinitionError> {
-    Ok(WorkerContribution::Registration(scheduled_registration(
+    let mut registration = scheduled_registration(
         WorkerId::try_new(WorkerKind::QuotaCatalogHealth, "openai-turn-state-tickets")?,
         Duration::from_secs(10),
         Box::new(crate::tickets::TicketTask(service)),
-    )?))
+    )?;
+    // 票缓存与并发槽属于本进程，且部署合同为单副本；无需等待共享 Redis 调度租约。
+    if let WorkerRunnable::Scheduled { lease, .. } = &mut registration.runnable {
+        *lease = None;
+    }
+    Ok(WorkerContribution::Registration(registration))
 }
 
 pub(super) const WORKER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);

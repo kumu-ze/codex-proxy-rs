@@ -32,7 +32,7 @@ const selectedProxy = ref('')
 const importing = ref(false)
 const savedProxyOptions = computed(() => savedProxies.value.map(p => ({ value: p.id, label: `${p.name} · ${p.endpoint}` })))
 function addProxy() {
-  poolDraft.value.push({ key: ++proxyKey, name: `代理 ${poolDraft.value.length + 1}`, url: '', endpoint: '', hasAuthentication: false })
+  poolDraft.value.push({ key: ++proxyKey, name: `代理 ${poolDraft.value.length + 1}`, url: '', endpoint: '', hasAuthentication: false, enabled: true, concurrency: 1 })
 }
 async function loadSavedProxies() {
   importing.value = true
@@ -55,7 +55,7 @@ function importProxy() {
   const item = savedProxies.value.find(p => p.id === selectedProxy.value)
   if (!item)
     return
-  poolDraft.value.push({ key: ++proxyKey, name: item.name, savedProxyId: item.id, endpoint: item.endpoint, hasAuthentication: item.hasAuthentication })
+  poolDraft.value.push({ key: ++proxyKey, name: item.name, savedProxyId: item.id, endpoint: item.endpoint, hasAuthentication: item.hasAuthentication, enabled: true, concurrency: 1 })
   selectedProxy.value = ''
 }
 const search = ref('')
@@ -103,11 +103,12 @@ function accept(data: TicketPanel) {
   draftRevision.value = data.revision
   draft.value = structuredClone(data.settings)
   draft.value.manualIntervalSeconds ??= 0
+  draft.value.proxyPoolEnabled ??= true
   models.value = data.settings.models.join(', ')
   policies.value = Object.fromEntries(data.accounts.map(a => [a.id, { ...a.policy }]))
   customLengths.value = Object.fromEntries(data.accounts.map(a => [a.id, a.policy.targetLength?.toString() ?? '']))
   proxy.value = ''
-  poolDraft.value = (data.proxies ?? []).map(p => ({ ...p, key: ++proxyKey, url: '' }))
+  poolDraft.value = (data.proxies ?? []).map(p => ({ ...p, key: ++proxyKey, url: '', enabled: p.enabled ?? true, concurrency: p.concurrency ?? 1 }))
   clearProxy.value = false
 }
 async function load() {
@@ -155,7 +156,7 @@ async function save() {
     return
   }
   const proxyPool = proxy.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean)
-  const proxies: TicketProxyInput[] = poolDraft.value.map(p => ({ id: p.id, name: p.name.trim(), url: p.url?.trim() || undefined, savedProxyId: p.savedProxyId }))
+  const proxies: TicketProxyInput[] = poolDraft.value.map(p => ({ id: p.id, name: p.name.trim(), url: p.url?.trim() || undefined, savedProxyId: p.savedProxyId, enabled: p.enabled ?? true, concurrency: p.concurrency ?? 1 }))
   proxies.push(...proxyPool.map((url, i) => ({ name: `代理 ${poolDraft.value.length + i + 1}`, url })))
   if (!clearProxy.value && proxies.length > 64) {
     toast.warning('代理池最多 64 个代理')
@@ -163,6 +164,10 @@ async function save() {
   }
   if (!clearProxy.value && proxies.some(p => !p.name || (!p.id && !p.savedProxyId && !p.url))) {
     toast.warning('请填写代理名称和新代理完整地址')
+    return
+  }
+  if (proxies.some(p => p.concurrency !== undefined && (!Number.isInteger(p.concurrency) || p.concurrency < 1 || p.concurrency > 3))) {
+    toast.warning('每个代理入口并发应为 1–3')
     return
   }
   if (settings.enabled && (clearProxy.value || !proxies.length)) {
@@ -248,7 +253,7 @@ useIntervalFn(async () => {
           </div>
         </div>
         <p class="mt-4 text-sm text-cp-text-secondary">
-          长度是可配置的匹配规则，不代表模型能力或质量。未获票时维持原转发；关闭打标的账号不探测、不注入。保存策略会清除旧票。
+          长度是可配置的匹配规则，不代表模型能力或质量。未获票时维持原转发；关闭打标的账号不探测、不注入。保存会保留仍符合规则的有效票。
         </p>
         <div class="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           <label class="flex flex-col gap-2" for="ticket-plus">Plus / Pro 默认长度<input id="ticket-plus" v-model.number="draft.plusProLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
@@ -271,6 +276,7 @@ useIntervalFn(async () => {
           <h3 class="font-semibold">
             已保存 {{ panel.proxyCount }} 个代理
           </h3>
+          <BaseSwitch v-model="draft.proxyPoolEnabled" label="启用打标代理池" show-label />
           <BaseButton :disabled="clearProxy || poolDraft.length >= 64" title="新增代理" aria-label="新增代理" @click="addProxy">
             <Plus :size="16" />
           </BaseButton>
@@ -283,15 +289,20 @@ useIntervalFn(async () => {
           </BaseButton>
         </div>
         <div v-for="entry in poolDraft" :key="entry.key" class="mt-3 flex flex-wrap items-center gap-3">
+          <BaseSwitch v-model="entry.enabled" :label="`启用 ${entry.name || '代理'}`" :disabled="clearProxy" />
           <BaseInput v-model="entry.name" aria-label="代理名称" class="w-full sm:w-44" :disabled="clearProxy" />
           <span class="min-w-0 flex-1 break-all font-mono text-sm">{{ entry.endpoint || '新代理' }} · {{ entry.hasAuthentication ? '已保存认证' : '无已保存认证' }}</span>
           <BaseInput v-if="!entry.savedProxyId" v-model="entry.url" :aria-label="`${entry.name} 代理地址`" type="password" autocomplete="new-password" :placeholder="entry.id !== undefined ? '留空保留地址及认证；输入完整 URL 替换' : 'socks5://用户名:密码@主机:端口'" class="w-full sm:w-80" :disabled="clearProxy" />
           <span v-else class="text-sm text-cp-text-secondary">保存时导入认证</span>
+          <BaseSelect :model-value="String(entry.concurrency ?? 1)" :options="[{ label: '并发 1', value: '1' }, { label: '并发 2', value: '2' }, { label: '并发 3', value: '3' }]" :aria-label="`${entry.name} 并发数`" :disabled="clearProxy" class="w-28" @update:model-value="entry.concurrency = Number($event)" />
           <BaseButton :aria-label="`移除 ${entry.name}`" title="移除代理" :disabled="clearProxy" @click="poolDraft = poolDraft.filter(p => p.key !== entry.key)">
             <Trash2 :size="16" />
           </BaseButton>
         </div>
         <div class="mt-4">
+          <p class="mb-3 text-sm text-cp-text-secondary">
+            暂停代理池或禁用单个入口会保留配置和已获有效票，已发出的探测会正常结束。并发按代理入口计算，整个服务最多同时 12 个探测。
+          </p>
           <BaseSwitch v-model="clearProxy" label="清除已保存的代理（需同时关闭打标）" show-label />
         </div>
       </BaseCard>
@@ -304,6 +315,7 @@ useIntervalFn(async () => {
         </div>
         <p class="mb-4 text-sm text-cp-text-secondary">
           修改模式后先保存。自动模式也支持手动打一张；每次按钮只发送一个请求，限流会退避。刷新会放弃未保存草稿。
+          后台最近检查：{{ time(panel.workerCheckedAt) }}。
         </p>
         <p v-if="!rows.length" class="py-8 text-center text-cp-text-secondary">
           暂无匹配的 OAuth 账号
@@ -334,7 +346,7 @@ useIntervalFn(async () => {
                 <p class="mt-1 text-xs text-cp-text-secondary">
                   到期：{{ time(status.expiresAt) }}<span v-if="status.manualRetryAt"> · 下次可手动探测：{{ time(status.manualRetryAt) }}</span>
                 </p>
-                <BaseButton class="mt-3" :disabled="!!probing || saving || !panel.settings.enabled || !panel.proxyConfigured || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
+                <BaseButton class="mt-3" :disabled="!!probing || saving || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
                   {{ probing === `${account.id}/${status.model}` || status.busy ? '探测中…' : '手动打一张' }}
                 </BaseButton>
               </div>

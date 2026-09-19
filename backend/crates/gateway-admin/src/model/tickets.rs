@@ -24,6 +24,8 @@ pub struct TicketAccountPolicy {
 pub struct TicketSettings {
     pub enabled: bool,
     pub inject: bool,
+    #[serde(default = "default_pool_enabled")]
+    pub proxy_pool_enabled: bool,
     pub plus_pro_length: usize,
     pub business_length: usize,
     pub default_length: usize,
@@ -41,6 +43,7 @@ impl Default for TicketSettings {
         Self {
             enabled: false,
             inject: false,
+            proxy_pool_enabled: true,
             plus_pro_length: 292,
             business_length: 332,
             default_length: 292,
@@ -52,6 +55,10 @@ impl Default for TicketSettings {
             accounts: BTreeMap::new(),
         }
     }
+}
+
+fn default_pool_enabled() -> bool {
+    true
 }
 
 impl TicketSettings {
@@ -163,6 +170,7 @@ pub struct TicketPanel {
     pub accounts: Vec<TicketAccountStatus>,
     pub logs: Vec<TicketLog>,
     pub log_limit: usize,
+    pub worker_checked_at: Option<u64>,
 }
 
 // 不派生 Debug，避免代理认证进入日志；None 保留，空串清除。
@@ -184,6 +192,9 @@ pub struct TicketProxyView {
     pub name: String,
     pub endpoint: String,
     pub has_authentication: bool,
+    pub enabled: bool,
+    pub concurrency: usize,
+    pub in_flight: usize,
 }
 
 // URL 只允许写入，不派生 Debug；旧条目凭 revision + id 保留认证。
@@ -194,6 +205,10 @@ pub struct TicketProxyInput {
     pub name: String,
     pub url: Option<String>,
     pub saved_proxy_id: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub concurrency: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

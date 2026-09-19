@@ -27,6 +27,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 
 const HEADER: &str = "x-codex-turn-state";
 const LOG_LIMIT: usize = 1000;
+const MAX_PROBE_CONCURRENCY: usize = 12;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Ticket {
@@ -49,6 +50,10 @@ struct Persisted {
     proxy_pool: Vec<String>,
     #[serde(default)]
     proxy_names: Vec<String>,
+    #[serde(default)]
+    proxy_enabled: Vec<bool>,
+    #[serde(default)]
+    proxy_concurrency: Vec<usize>,
     tickets: Vec<Ticket>,
     #[serde(default)]
     logs: Vec<TicketLog>,
@@ -62,6 +67,8 @@ impl Default for Persisted {
             proxy_url: String::new(),
             proxy_pool: Vec::new(),
             proxy_names: Vec::new(),
+            proxy_enabled: Vec::new(),
+            proxy_concurrency: Vec::new(),
             tickets: Vec::new(),
             logs: Vec::new(),
         }
@@ -73,8 +80,10 @@ struct Observations {
     last: BTreeMap<(String, String), TicketResult>,
     retry: BTreeMap<String, u64>,
     manual_retry: BTreeMap<String, u64>,
-    busy: Option<(String, String)>,
+    busy: BTreeMap<(String, String), usize>,
+    proxy_busy: BTreeMap<String, usize>,
     proxy_cursor: usize,
+    worker_checked_at: Option<u64>,
 }
 
 impl Observations {
@@ -176,6 +185,10 @@ impl TicketService {
             data.proxy_pool = split_proxy_pool(&data.proxy_url);
         }
         if !data.settings.validate()
+            || data
+                .proxy_concurrency
+                .iter()
+                .any(|limit| !(1..=3).contains(limit))
             || data.proxy_pool.len() > 64
             || !data
                 .proxy_pool
@@ -222,7 +235,7 @@ impl TicketService {
             data: Arc::new(Mutex::new(data)),
             observations: Mutex::new(observations),
             persistence: Arc::new(AsyncMutex::new(())),
-            request_slot: Semaphore::new(1),
+            request_slot: Semaphore::new(MAX_PROBE_CONCURRENCY),
         })
     }
 
@@ -304,7 +317,7 @@ impl TicketService {
                                 ready: ticket.is_some(),
                                 expires_at: ticket.map(|t| t.expires_at),
                                 last_result: o.last.get(&key).cloned(),
-                                busy: o.busy.as_ref() == Some(&key),
+                                busy: o.busy.contains_key(&key),
                                 retry_at: o.retry_at(id, d.settings.interval_seconds, false),
                                 manual_retry_at: o.retry_at(
                                     id,
@@ -333,6 +346,13 @@ impl TicketService {
                 .iter()
                 .enumerate()
                 .map(|(index, proxy)| TicketProxyView {
+                    enabled: d.proxy_enabled.get(index).copied().unwrap_or(true),
+                    concurrency: d.proxy_concurrency.get(index).copied().unwrap_or(1),
+                    in_flight: o
+                        .proxy_busy
+                        .get(&proxy_endpoint(proxy))
+                        .copied()
+                        .unwrap_or(0),
                     id: index.to_string(),
                     name: d
                         .proxy_names
@@ -348,6 +368,7 @@ impl TicketService {
             accounts: rows,
             logs: d.logs.iter().rev().cloned().collect(),
             log_limit: LOG_LIMIT,
+            worker_checked_at: o.worker_checked_at,
         })
     }
 
@@ -447,7 +468,25 @@ impl TicketService {
             }
             let mut urls = Vec::new();
             let mut names = Vec::new();
+            let mut enabled = Vec::new();
+            let mut concurrency = Vec::new();
             for entry in entries {
+                let previous_index = entry.id.as_deref().and_then(|id| id.parse::<usize>().ok());
+                let limit = entry
+                    .concurrency
+                    .or_else(|| previous_index.and_then(|i| next.proxy_concurrency.get(i).copied()))
+                    .unwrap_or(1);
+                if !(1..=3).contains(&limit) {
+                    return Err(error(ProviderAdminErrorKind::Invalid)
+                        .with_public_message("每个代理入口并发应为 1–3"));
+                }
+                enabled.push(
+                    entry
+                        .enabled
+                        .or_else(|| previous_index.and_then(|i| next.proxy_enabled.get(i).copied()))
+                        .unwrap_or(true),
+                );
+                concurrency.push(limit);
                 let name = entry.name.trim();
                 if name.is_empty()
                     || name.len() > 128
@@ -479,9 +518,13 @@ impl TicketService {
             }
             next.proxy_pool = urls;
             next.proxy_names = names;
+            next.proxy_enabled = enabled;
+            next.proxy_concurrency = concurrency;
             next.proxy_url = next.proxy_pool.join("\n");
         }
         if let Some(pool) = requested_pool {
+            next.proxy_enabled = vec![true; pool.len()];
+            next.proxy_concurrency = vec![1; pool.len()];
             next.proxy_names = (1..=pool.len()).map(|i| format!("代理 {i}")).collect();
             next.proxy_url = pool.join("\n");
             next.proxy_pool = pool;
@@ -571,6 +614,15 @@ impl TicketService {
         input: TicketProbe,
         automatic: bool,
     ) -> Result<TicketResult, ProviderAdminError> {
+        self.probe_on_proxy(input, automatic, None).await
+    }
+
+    async fn probe_on_proxy(
+        &self,
+        input: TicketProbe,
+        automatic: bool,
+        forced_proxy: Option<usize>,
+    ) -> Result<TicketResult, ProviderAdminError> {
         let _permit = self
             .request_slot
             .try_acquire()
@@ -591,6 +643,7 @@ impl TicketService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if !snapshot.settings.enabled
+            || !snapshot.settings.proxy_pool_enabled
             || snapshot.proxy_pool.is_empty()
             || !snapshot.settings.models.contains(&input.model)
             || snapshot
@@ -607,7 +660,7 @@ impl TicketService {
         {
             return Err(error(ProviderAdminErrorKind::Invalid));
         }
-        {
+        let (proxy, proxy_name, proxy_key) = {
             let mut o = self
                 .observations
                 .lock()
@@ -623,28 +676,62 @@ impl TicketService {
                 return Err(error(ProviderAdminErrorKind::Conflict)
                     .with_public_message("账号仍在探测间隔或上游错误退避中，请稍后重试"));
             }
-            o.busy = Some((input.account_id.clone(), input.model.clone()));
-        }
-        let _busy = BusyGuard(&self.observations);
-        let target = snapshot
-            .settings
-            .target_length(&input.account_id, account.plan_type());
-        let (proxy, proxy_name) = {
-            let mut observations = self
-                .observations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let index = observations.proxy_cursor % snapshot.proxy_pool.len();
-            observations.proxy_cursor = observations.proxy_cursor.wrapping_add(1);
+            let key = (input.account_id.clone(), input.model.clone());
+            if !automatic && o.busy.contains_key(&key) {
+                return Err(error(ProviderAdminErrorKind::Conflict)
+                    .with_public_message("该账号模型已有探测正在执行"));
+            }
+            let start = o.proxy_cursor;
+            let index = (0..snapshot.proxy_pool.len())
+                .map(|offset| (start + offset) % snapshot.proxy_pool.len())
+                .find(|index| {
+                    if forced_proxy.is_some_and(|forced| forced != *index)
+                        || !snapshot.proxy_enabled.get(*index).copied().unwrap_or(true)
+                    {
+                        return false;
+                    }
+                    let endpoint = proxy_endpoint(&snapshot.proxy_pool[*index]);
+                    // 重复入口共用限额，不因重命名、认证别名或列表重排而绕过并发约束。
+                    let limit = snapshot
+                        .proxy_pool
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, p)| {
+                            snapshot.proxy_enabled.get(*i).copied().unwrap_or(true)
+                                && proxy_endpoint(p) == endpoint
+                        })
+                        .map(|(i, _)| snapshot.proxy_concurrency.get(i).copied().unwrap_or(1))
+                        .min()
+                        .unwrap_or(1);
+                    o.proxy_busy.get(&endpoint).copied().unwrap_or(0) < limit
+                })
+                .ok_or_else(|| {
+                    error(ProviderAdminErrorKind::Conflict)
+                        .with_public_message("代理池已暂停、全部代理已禁用或并发已满")
+                })?;
+            o.proxy_cursor = index.wrapping_add(1);
+            let proxy = snapshot.proxy_pool[index].clone();
+            let endpoint = proxy_endpoint(&proxy);
+            *o.proxy_busy.entry(endpoint.clone()).or_default() += 1;
+            *o.busy.entry(key).or_default() += 1;
             (
-                snapshot.proxy_pool[index].clone(),
+                proxy,
                 snapshot
                     .proxy_names
                     .get(index)
                     .cloned()
                     .unwrap_or_else(|| format!("代理 {}", index + 1)),
+                endpoint,
             )
         };
+        let _busy = BusyGuard {
+            observations: &self.observations,
+            key: (input.account_id.clone(), input.model.clone()),
+            proxy: proxy_key,
+        };
+        let target = snapshot
+            .settings
+            .target_length(&input.account_id, account.plan_type());
         let started_at = now();
         let started = Instant::now();
         let credential = self
@@ -744,9 +831,15 @@ impl TicketService {
             .observations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        o.retry.insert(input.account_id.clone(), retry_at);
+        o.retry
+            .entry(input.account_id.clone())
+            .and_modify(|t| *t = (*t).max(retry_at))
+            .or_insert(retry_at);
         if matches!(status, 429 | 401 | 403) {
-            o.manual_retry.insert(input.account_id.clone(), retry_at);
+            o.manual_retry
+                .entry(input.account_id.clone())
+                .and_modify(|t| *t = (*t).max(retry_at))
+                .or_insert(retry_at);
         }
         o.last
             .insert((input.account_id, input.model), result.clone());
@@ -874,13 +967,29 @@ fn proxy_endpoint(raw: &str) -> String {
     }
 }
 
-struct BusyGuard<'a>(&'a Mutex<Observations>);
+struct BusyGuard<'a> {
+    observations: &'a Mutex<Observations>,
+    key: (String, String),
+    proxy: String,
+}
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
-        self.0
+        let mut observations = self
+            .observations
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .busy = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = observations.busy.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                observations.busy.remove(&self.key);
+            }
+        }
+        if let Some(count) = observations.proxy_busy.get_mut(&self.proxy) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                observations.proxy_busy.remove(&self.proxy);
+            }
+        }
     }
 }
 
@@ -938,12 +1047,20 @@ pub(crate) struct TicketTask(pub(crate) Arc<TicketService>);
 impl ScheduledTask for TicketTask {
     fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
         Box::pin(async move {
+            self.0
+                .observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .worker_checked_at = Some(now());
             let panel = self
                 .0
                 .panel()
                 .await
                 .map_err(|_| WorkerTaskError::safe("打标目录读取失败"))?;
-            if !panel.settings.enabled || !panel.proxy_configured {
+            if !panel.settings.enabled
+                || !panel.settings.proxy_pool_enabled
+                || !panel.proxy_configured
+            {
                 return Ok(());
             }
             let candidates: Vec<_> = panel
@@ -984,13 +1101,49 @@ impl ScheduledTask for TicketTask {
                     })
                     .expect("候选非空")
             };
-            // 每周期最多一发，与手动任务共享并发槽；取消直接丢弃请求 future。
+            // 同一账号模型按各入口配额并发尝试；达到全局上限后从轮换游标公平选择。
+            let snapshot = self
+                .0
+                .data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let start = self
+                .0
+                .observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .proxy_cursor;
+            let mut slots = Vec::new();
+            for offset in 0..snapshot.proxy_pool.len() {
+                let index = (start + offset) % snapshot.proxy_pool.len();
+                if snapshot.proxy_enabled.get(index).copied().unwrap_or(true) {
+                    for _ in 0..snapshot.proxy_concurrency.get(index).copied().unwrap_or(1) {
+                        if slots.len() < MAX_PROBE_CONCURRENCY {
+                            slots.push(index);
+                        }
+                    }
+                }
+            }
+            let probes = futures::future::join_all(slots.into_iter().map(|index| {
+                self.0.probe_on_proxy(
+                    TicketProbe {
+                        account_id: input.account_id.clone(),
+                        model: input.model.clone(),
+                    },
+                    true,
+                    Some(index),
+                )
+            }));
             tokio::select! {
                 () = context.cancellation().cancelled() => {},
-                result = self.0.probe_with_mode(input, true) => {
-                    if let Ok(result) = result {
-                        tracing::info!(account_id = %result.account_id, model = %result.model,
-                            http = result.http_status, length = result.length, matched = result.matched, "后台打标完成");
+                results = probes => {
+                    for result in results {
+                        match result {
+                            Ok(result) => tracing::info!(account_id = %result.account_id, model = %result.model,
+                                http = result.http_status, length = result.length, matched = result.matched, "后台打标完成"),
+                            Err(error) => tracing::warn!(kind = ?error.kind(), "后台打标未执行"),
+                        }
                     }
                 }
             }
