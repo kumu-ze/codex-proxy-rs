@@ -4,6 +4,10 @@ use crate::{
     credential::{CodexCredentialRepository, CodexRuntimeAuthentication},
     transport::{CODEX_RESPONSES_PATH, endpoint_url, profile::CodexWireProfileState},
 };
+use base64::{
+    Engine as _,
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+};
 use futures::future::BoxFuture;
 use gateway_admin::{
     model::tickets::*,
@@ -29,6 +33,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 const HEADER: &str = "x-codex-turn-state";
 const LOG_LIMIT: usize = 1000;
 const MAX_PROBE_CONCURRENCY: usize = 12;
+const EXIT_SAMPLE_TTL: u64 = 600;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Ticket {
@@ -96,6 +101,8 @@ struct Observations {
     proxy_cursor: usize,
     worker_checked_at: Option<u64>,
     continuous: BTreeMap<(String, String), ContinuousProbe>,
+    last_requests: BTreeMap<(String, String), u64>,
+    exit_samples: BTreeMap<String, TicketExitSample>,
 }
 
 #[derive(Clone)]
@@ -134,6 +141,7 @@ pub(crate) struct TicketService {
     observations: Mutex<Observations>,
     persistence: Arc<AsyncMutex<()>>,
     request_slot: Semaphore,
+    exit_slot: Semaphore,
 }
 
 fn now() -> u64 {
@@ -150,6 +158,31 @@ fn valid_state(state: &str, length: usize) -> bool {
         && state
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"_-=".contains(&c))
+}
+
+// Fernet 的公开时间字段是创建时间；没有密钥不能验签，不能据此推导上游失效时间。
+fn token_timestamp(state: &str) -> Option<u64> {
+    if state.len() > 4096 {
+        return None;
+    }
+    let raw = URL_SAFE
+        .decode(state)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(state))
+        .ok()?;
+    if raw.len() < 73 || raw[0] != 0x80 || (raw.len() - 57) % 16 != 0 {
+        return None;
+    }
+    let timestamp = u64::from_be_bytes(raw[1..9].try_into().ok()?);
+    (timestamp <= now().saturating_add(300)).then_some(timestamp)
+}
+
+fn gated_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    ["gpt-6", "gpt-5.6"].iter().any(|prefix| {
+        model
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-') || rest.starts_with('.'))
+    })
 }
 fn eligible(account: &ProviderAccount) -> bool {
     account.enabled()
@@ -270,6 +303,7 @@ impl TicketService {
             observations: Mutex::new(observations),
             persistence: Arc::new(AsyncMutex::new(())),
             request_slot: Semaphore::new(MAX_PROBE_CONCURRENCY),
+            exit_slot: Semaphore::new(1),
         })
     }
 
@@ -361,6 +395,16 @@ impl TicketService {
                                 model: model.clone(),
                                 ready: ticket.is_some(),
                                 expires_at: ticket.map(|t| t.expires_at),
+                                token_issued_at: ticket.and_then(|t| token_timestamp(&t.state)),
+                                last_requested_at: o.last_requests.get(&key).copied(),
+                                auto_paused: d.settings.activity_only
+                                    && o.last_requests.get(&key).is_none_or(|t| {
+                                        t.saturating_add(d.settings.idle_seconds) <= now()
+                                    }),
+                                blocked: d.settings.enabled
+                                    && d.settings.require_ticket
+                                    && gated_model(model)
+                                    && ticket.is_none(),
                                 last_result: o.last.get(&key).cloned(),
                                 busy: o.busy.contains_key(&key),
                                 retry_at: o.retry_at(id, d.settings.interval_seconds, false),
@@ -411,6 +455,7 @@ impl TicketService {
                 .iter()
                 .enumerate()
                 .map(|(index, proxy)| TicketProxyView {
+                    exit_sample: o.exit_samples.get(proxy).cloned(),
                     enabled: d.proxy_enabled.get(index).copied().unwrap_or(true),
                     concurrency: d.proxy_concurrency.get(index).copied().unwrap_or(1),
                     in_flight: o
@@ -642,6 +687,27 @@ impl TicketService {
         self.panel().await
     }
 
+    /// 只记录真实业务调用；合成打标请求不经过此入口，不能自我唤醒。
+    pub(crate) fn note_request(&self, account: &ProviderAccount, model: &str) -> bool {
+        let d = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !d.settings.enabled || account.authentication_kind() != "oauth" {
+            return false;
+        }
+        if d.settings.models.iter().any(|m| m == model)
+            && d.settings.accounts.contains_key(account.id().as_str())
+        {
+            self.observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last_requests
+                .insert((account.id().as_str().to_owned(), model.to_owned()), now());
+        }
+        d.settings.require_ticket && gated_model(model)
+    }
+
     pub(crate) fn get(
         &self,
         account: &ProviderAccount,
@@ -720,6 +786,111 @@ impl TicketService {
         next.logs.clear();
         self.commit(next, guard).await?;
         self.panel().await
+    }
+
+    /// 独立连接采样，不宣称是某次打标的实际出口；只手动触发，成功缓存十分钟。
+    pub(crate) async fn sample_exit(
+        &self,
+        input: TicketExitProbe,
+    ) -> Result<TicketExitSample, ProviderAdminError> {
+        let proxy = {
+            let d = self
+                .data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if d.revision != input.revision {
+                return Err(error(ProviderAdminErrorKind::Conflict));
+            }
+            input
+                .proxy_id
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| d.proxy_pool.get(i))
+                .cloned()
+                .ok_or_else(|| error(ProviderAdminErrorKind::Invalid))?
+        };
+        if let Some(sample) = self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .exit_samples
+            .get(&proxy)
+            .filter(|s| {
+                s.checked_at
+                    .saturating_add(if s.ip.is_some() { EXIT_SAMPLE_TTL } else { 60 })
+                    > now()
+            })
+            .cloned()
+        {
+            return Ok(sample);
+        }
+        let _slot = self.exit_slot.try_acquire().map_err(|_| {
+            error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("已有出口检测正在进行，请稍后重试")
+        })?;
+        let measured = self.measure_exit(&proxy).await;
+        let sample = match measured {
+            Ok(ip) => TicketExitSample {
+                ip: Some(ip),
+                checked_at: now(),
+                message: "独立连接采样，不保证与打标连接相同".into(),
+            },
+            Err(message) => TicketExitSample {
+                ip: None,
+                checked_at: now(),
+                message: message.into(),
+            },
+        };
+        let d = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if d.revision != input.revision {
+            return Err(error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("代理配置已改变，请刷新后重新检测"));
+        }
+        let mut o = self
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        o.exit_samples.retain(|url, _| d.proxy_pool.contains(url));
+        o.exit_samples.insert(proxy, sample.clone());
+        Ok(sample)
+    }
+
+    async fn measure_exit(&self, proxy: &str) -> Result<std::net::IpAddr, &'static str> {
+        let mut url = url::Url::parse(&self.url).map_err(|_| "检测地址无效")?;
+        url.set_path("/cdn-cgi/trace");
+        url.set_query(None);
+        url.set_fragment(None);
+        // 与打标目标使用同一域名，避免域名分流；不附带账号凭据，也不跟随重定向。
+        let client = probe_client(proxy, Duration::from_secs(5))?;
+        let mut response = client
+            .get(url)
+            .header("user-agent", self.profile.snapshot().user_agent())
+            .send()
+            .await
+            .map_err(|_| "出口检测连接失败或超时")?;
+        if !response.status().is_success() {
+            return Err("出口检测服务返回错误状态");
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| "出口检测响应读取失败")?
+        {
+            if body.len() + chunk.len() > 1024 {
+                return Err("出口检测响应过大");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        std::str::from_utf8(&body)
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|line| {
+                    line.strip_prefix("ip=")
+                        .and_then(|ip| ip.trim().parse().ok())
+                })
+            })
+            .ok_or("出口检测未返回有效 IP")
     }
 
     pub(crate) async fn continuous(
@@ -1013,7 +1184,7 @@ impl TicketService {
         {
             return Err(error(ProviderAdminErrorKind::Invalid));
         }
-        let (proxy, proxy_name, proxy_key) = {
+        let (proxy, proxy_name, proxy_key, exit_sample) = {
             let mut o = self
                 .observations
                 .lock()
@@ -1067,6 +1238,11 @@ impl TicketService {
             o.proxy_cursor = index.wrapping_add(1);
             let proxy = snapshot.proxy_pool[index].clone();
             let endpoint = proxy_endpoint(&proxy);
+            let exit_sample = o
+                .exit_samples
+                .get(&proxy)
+                .filter(|s| s.ip.is_some() && s.checked_at.saturating_add(EXIT_SAMPLE_TTL) > now())
+                .cloned();
             *o.proxy_busy.entry(endpoint.clone()).or_default() += 1;
             *o.busy.entry(key).or_default() += 1;
             (
@@ -1077,6 +1253,7 @@ impl TicketService {
                     .cloned()
                     .unwrap_or_else(|| format!("代理 {}", index + 1)),
                 endpoint,
+                exit_sample,
             )
         };
         let _busy = BusyGuard {
@@ -1140,6 +1317,7 @@ impl TicketService {
                 message
             },
         };
+        let token_issued_at = token_timestamp(&state);
         if matched {
             next.tickets.retain(|t| {
                 t.expires_at > now()
@@ -1162,6 +1340,8 @@ impl TicketService {
         };
         let retry_at = result.checked_at.saturating_add(delay);
         next.logs.push(TicketLog {
+            token_issued_at,
+            exit_sample,
             id: uuid::Uuid::new_v4().to_string(),
             account_name: account.name().into(),
             trigger: if automatic {
@@ -1214,16 +1394,7 @@ impl TicketService {
         proxy: &str,
     ) -> Result<(u16, String, u64, String), &'static str> {
         let auth = authentication.oauth().ok_or("账号没有 OAuth 凭据")?;
-        let builder = reqwest::Client::builder()
-            .no_proxy()
-            .http1_only()
-            .pool_max_idle_per_host(0)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(25))
-            .proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理配置无效")?);
-        let client = crate::transport::tls::build_reqwest_client_with_custom_ca(builder)
-            .map_err(|_| "请求客户端初始化失败")?;
+        let client = probe_client(proxy, Duration::from_secs(25))?;
         let profile = self.profile.snapshot();
         // 复用 RS 已核验画像；仅在 Astra 最低版本约束下提升版本，避免身份字段不一致。
         let mut version = profile.codex_version.clone();
@@ -1304,6 +1475,19 @@ impl TicketService {
         };
         Ok((status, state, retry, message.into()))
     }
+}
+
+fn probe_client(proxy: &str, timeout: Duration) -> Result<reqwest::Client, &'static str> {
+    let builder = reqwest::Client::builder()
+        .no_proxy()
+        .http1_only()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .timeout(timeout)
+        .proxy(reqwest::Proxy::all(proxy).map_err(|_| "代理配置无效")?);
+    crate::transport::tls::build_reqwest_client_with_custom_ca(builder)
+        .map_err(|_| "请求客户端初始化失败")
 }
 
 fn proxy_endpoint(raw: &str) -> String {
@@ -1450,6 +1634,7 @@ impl ScheduledTask for TicketTask {
                         .iter()
                         .filter(|m| {
                             !m.busy
+                                && !m.auto_paused
                                 && m.continuous.is_none()
                                 && m.retry_at.is_none()
                                 && m.expires_at.is_none_or(|t| {

@@ -14,6 +14,11 @@ async fn ticket_endpoints_require_admin_session() {
         ("/api/admin/tickets", "POST", "{}"),
         ("/api/admin/tickets/logs/clear", "POST", ""),
         (
+            "/api/admin/tickets/proxy-exit",
+            "POST",
+            "{\"proxyId\":\"0\",\"revision\":1}",
+        ),
+        (
             "/api/admin/tickets/continuous",
             "POST",
             "{\"accountId\":\"acct_test\",\"model\":\"gpt-6-astra\",\"intervalSeconds\":10}",

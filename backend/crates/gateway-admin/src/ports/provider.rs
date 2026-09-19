@@ -128,6 +128,14 @@ pub trait ProviderAdmin: Send + Sync {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }
 
+    /// 按需检测代理出口；返回的采样不是实际打标连接的出口证明。
+    async fn ticket_exit_sample(
+        &self,
+        _input: crate::model::tickets::TicketExitProbe,
+    ) -> Result<crate::model::tickets::TicketExitSample, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     /// 清理可见历史，不改变有效票或请求退避。
     async fn clear_ticket_logs(
         &self,

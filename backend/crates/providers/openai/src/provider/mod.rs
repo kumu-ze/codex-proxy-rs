@@ -579,14 +579,23 @@ impl Provider for CodexProvider {
             account_scope,
         );
         // 先清理客户端跨账号状态，再注入当前账号/模型的管理票，防止被身份清理抹掉。
-        if let Some(state) = self.tickets.as_ref().and_then(|s| {
-            s.get(
+        if let Some(tickets) = self.tickets.as_ref() {
+            let required = tickets.note_request(lease.account(), upstream_model.as_str());
+            let state = tickets.get(
                 lease.account(),
                 lease.authentication(),
                 upstream_model.as_str(),
-            )
-        }) {
-            upstream_request.apply_managed_turn_state(state);
+            );
+            if required && state.is_none() {
+                return Err(provider_error(ProviderErrorKind::NoEligibleAccount, UpstreamSendState::NotSent)
+                    .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+                        "RS 打标保护：该账号和模型尚无有效票，请启用对应模型的自动打标或手动获取后重试。",
+                        Some("ticket_required".into()), Some("service_unavailable".into()),
+                    )));
+            }
+            if let Some(state) = state {
+                upstream_request.apply_managed_turn_state(state);
+            }
         }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = lease

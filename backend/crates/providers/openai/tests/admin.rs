@@ -196,6 +196,233 @@ async fn runtime_catalog_read_returns_immediately_and_coalesces_background_refre
 }
 
 #[tokio::test]
+async fn ticket_demand_mode_sleeps_wakes_and_gate_does_not_trip_provider_circuit() {
+    let (_config, _store, server, mut bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let mut p = admin.ticket_panel().await.unwrap();
+    p.settings.enabled = true;
+    p.settings.inject = true;
+    p.settings.activity_only = true;
+    p.settings.idle_seconds = 10;
+    p.settings.interval_seconds = 10;
+    p.settings.require_ticket = true;
+    p.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Auto,
+            target_length: Some(292),
+        },
+    );
+    admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: Some(server.uri()),
+            proxy_pool: None,
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured = Arc::clone(&count);
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ResponseTemplate::new(200).insert_header(
+                "x-codex-turn-state",
+                format!("gAAAAA{}", "a".repeat(if n == 0 { 306 } else { 286 })),
+            )
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let (task, context) = ticket_task(&mut bundle);
+    task.run_cycle(context.clone()).await.unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for turn in 0..2 {
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-6-astra","input":"ping"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let result = bundle
+            .core_provider()
+            .execute(
+                initialized_provider_request_for_model(
+                    Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                    "acct_ticket_a",
+                    "gpt-6-astra",
+                ),
+                initialized_attempt_context(&format!("req_ticket_demand_{turn}"), "acct_ticket_a"),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("ticket required before probe")
+        };
+        assert_eq!(
+            error.kind(),
+            gateway_core::error::ProviderErrorKind::NoEligibleAccount
+        );
+        assert!(!gateway_core::engine::execution::provider_failure_affects_circuit(error.kind()));
+        assert_eq!(
+            error.client_visible_upstream_error().unwrap().code(),
+            Some("ticket_required")
+        );
+        task.run_cycle(context.clone()).await.unwrap();
+        if turn == 0 {
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            task.run_cycle(context.clone()).await.unwrap();
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let p = admin.ticket_panel().await.unwrap();
+            assert!(
+                p.accounts
+                    .iter()
+                    .find(|a| a.id == "acct_ticket_a")
+                    .unwrap()
+                    .models[0]
+                    .auto_paused
+            );
+        }
+    }
+    let p = admin.ticket_panel().await.unwrap();
+    assert!(
+        p.accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .ready
+    );
+    let payload = ProtocolPayload::json_object(
+        "openai",
+        json!({"model":"gpt-6-astra","input":"ping"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        bundle
+            .core_provider()
+            .execute(
+                initialized_provider_request_for_model(
+                    Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                    "acct_ticket_a",
+                    "gpt-6-astra"
+                ),
+                initialized_attempt_context("req_ticket_demand_allowed", "acct_ticket_a")
+            )
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn ticket_exit_sample_is_cached_and_timestamp_is_not_used_as_expiry() {
+    use gateway_admin::model::tickets::TicketExitProbe;
+    let (_config, _store, server, bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let mut p = admin.ticket_panel().await.unwrap();
+    p.settings.enabled = true;
+    p.settings.inject = true;
+    p.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Manual,
+            target_length: Some(292),
+        },
+    );
+    let p = admin
+        .update_tickets(TicketUpdate {
+            revision: p.revision,
+            settings: p.settings,
+            proxy_url: Some(server.uri()),
+            proxy_pool: None,
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/cdn-cgi/trace"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("fl=test\nip=2001:db8::42\n"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let request = TicketExitProbe {
+        revision: p.revision,
+        proxy_id: "0".into(),
+    };
+    let sample = admin.ticket_exit_sample(request.clone()).await.unwrap();
+    assert_eq!(sample.ip.unwrap().to_string(), "2001:db8::42");
+    assert_eq!(
+        admin.ticket_exit_sample(request).await.unwrap().checked_at,
+        sample.checked_at
+    );
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let issued = now - 300;
+    let mut raw = vec![0u8; 217];
+    raw[0] = 0x80;
+    raw[1..9].copy_from_slice(&issued.to_be_bytes());
+    let state = base64::engine::general_purpose::URL_SAFE.encode(raw);
+    assert_eq!(state.len(), 292);
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-codex-turn-state", state.as_str()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-6-astra".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .matched
+    );
+    let p = admin.ticket_panel().await.unwrap();
+    let model = &p
+        .accounts
+        .iter()
+        .find(|a| a.id == "acct_ticket_a")
+        .unwrap()
+        .models[0];
+    assert_eq!(model.token_issued_at, Some(issued));
+    assert!(model.expires_at.unwrap() >= now + 3600);
+    assert_eq!(p.logs[0].token_issued_at, Some(issued));
+    assert_eq!(p.logs[0].exit_sample.as_ref().unwrap().ip, sample.ip);
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .find(|r| r.method == "GET")
+            .unwrap()
+            .headers
+            .contains_key("authorization")
+    );
+    assert!(
+        admin
+            .ticket_exit_sample(TicketExitProbe {
+                revision: 1,
+                proxy_id: "0".into()
+            })
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn ticket_selected_proxy_and_noop_save_preserve_inflight_result() {
     let (_config, _store, first, bundle) = setup().await;
     let second = MockServer::start().await;
@@ -809,7 +1036,8 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
             ("opaque_request_headers".into(),json!([["x-codex-turn-state",base64::engine::general_purpose::STANDARD.encode("stale-header")]])),
         ]));
         let generate = GenerateRequest::from_protocol_payload(payload);
-        let generate = if index == 0 {
+        // 显式声明两次 A 请求的状态所有者，不能依赖 prompt cache/affinity 的偶然命中。
+        let generate = if index != 1 {
             generate.with_provider_session_state(
                 gateway_core::operation::ProviderSessionState::new(
                     "openai",
@@ -854,7 +1082,10 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
     assert_eq!(body["client_metadata"]["x-codex-turn-state"], ticket);
     assert_eq!(body["client_metadata"]["custom"], "keep");
     assert!(!requests[1].headers.contains_key("x-codex-turn-state"));
-    assert!(!requests[2].headers.contains_key("x-codex-turn-state"));
+    assert_eq!(
+        requests[2].headers.get("x-codex-turn-state").unwrap(),
+        "stale-header"
+    );
 }
 
 #[tokio::test]
@@ -3114,8 +3345,16 @@ fn reset_credit_command(account_id: ProviderAccountId) -> ConsumeProviderResetCr
 }
 
 fn initialized_provider_request(operation: Operation, account_id: &str) -> ProviderRequest {
+    initialized_provider_request_for_model(operation, account_id, "gpt-5.4")
+}
+
+fn initialized_provider_request_for_model(
+    operation: Operation,
+    account_id: &str,
+    model: &str,
+) -> ProviderRequest {
     let provider = ProviderKind::new("openai").expect("provider");
-    let upstream_model = UpstreamModelId::new("gpt-5.4").expect("upstream model");
+    let upstream_model = UpstreamModelId::new(model).expect("upstream model");
     let public_model = PublicModelId::new(upstream_model.as_str()).expect("public model");
     let account_scope = initialized_account_scope(account_id);
     let snapshot = RuntimeSnapshot::new(

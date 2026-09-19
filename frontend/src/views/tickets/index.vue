@@ -5,7 +5,7 @@ import { ChevronLeft, ChevronRight, Plus, Trash2 } from '@lucide/vue'
 import { useEventListener, useIntervalFn, useLocalStorage } from '@vueuse/core'
 import { computed, onMounted, ref, toRaw, watch } from 'vue'
 import { getProxies } from '@/api/modules/proxies'
-import { clearTicketLogs, continuousTicket, getTicketPanel, probeTicket, saveTicketSettings } from '@/api/modules/tickets'
+import { clearTicketLogs, continuousTicket, getTicketPanel, probeTicket, sampleTicketExit, saveTicketSettings } from '@/api/modules/tickets'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
@@ -26,6 +26,12 @@ const loading = ref(false)
 const saving = ref(false)
 const probing = ref('')
 const controlling = ref('')
+const samplingExit = ref('')
+const exitSamples = computed(() => new Map((panel.value?.proxies ?? []).map(p => [p.id, p.exitSample])))
+watch(() => draft.value?.requireTicket, (enabled) => {
+  if (enabled && draft.value)
+    draft.value.inject = true
+})
 const manualProxies = ref<Record<string, string>>({})
 const continuousIntervals = ref<Record<string, string>>({})
 const manualProxyOptions = computed(() => [
@@ -122,6 +128,7 @@ const modeOptions = [
 ]
 const rows = computed(() => (panel.value?.accounts ?? []).filter(a => `${a.name} ${a.id} ${a.plan ?? ''}`.toLowerCase().includes(search.value.toLowerCase())))
 const readyCount = computed(() => panel.value?.accounts.reduce((n, a) => n + a.models.filter(m => m.ready).length, 0) ?? 0)
+const autoAccountCount = computed(() => Object.values(policies.value).filter(p => p.mode === 'auto').length)
 
 function accept(data: TicketPanel) {
   lastStatusRefresh.value = Date.now() / 1000
@@ -131,6 +138,9 @@ function accept(data: TicketPanel) {
   draft.value = structuredClone(data.settings)
   draft.value.manualIntervalSeconds ??= 0
   draft.value.proxyPoolEnabled ??= true
+  draft.value.activityOnly ??= false
+  draft.value.idleSeconds ??= 120
+  draft.value.requireTicket ??= false
   models.value = data.settings.models.join(', ')
   policies.value = Object.fromEntries(data.accounts.map(a => [a.id, { ...a.policy }]))
   customLengths.value = Object.fromEntries(data.accounts.map(a => [a.id, a.policy.targetLength?.toString() ?? '']))
@@ -171,6 +181,7 @@ async function save() {
     [settings.manualIntervalSeconds, 0, 86400, '手动探测间隔应为 0–86400 秒的整数'],
     [settings.ttlSeconds, 60, 3600, '有效期应为 60–3600 秒的整数'],
     [settings.refreshBeforeSeconds, 0, settings.ttlSeconds - 1, '提前刷新时间必须为非负整数且小于有效期'],
+    [settings.idleSeconds, 10, 3600, '空闲暂停时间应为 10–3600 秒'],
   ]
   for (const [value, min, max, message] of ranges) {
     if (!Number.isInteger(value) || value < min || value > max) {
@@ -226,6 +237,22 @@ async function probe(account: TicketAccount, model: string) {
 }
 function time(value: number | null | undefined) {
   return value ? new Date(value * 1000).toLocaleString() : '—'
+}
+async function sampleExit(id: string) {
+  if (!panel.value || samplingExit.value)
+    return
+  samplingExit.value = id
+  try {
+    const sample = await sampleTicketExit({ proxyId: id, revision: panel.value.revision })
+    const current = panel.value.proxies.find(p => p.id === id)
+    if (current)
+      current.exitSample = sample
+    if (sample.ip)
+      toast.success('已取得出口采样，结果缓存 10 分钟')
+    else toast.warning(sample.message)
+  }
+  catch {}
+  finally { samplingExit.value = '' }
 }
 function manualInput(accountId: string, model: string) {
   const proxyId = manualProxies.value[`${accountId}/${model}`] ?? 'pool'
@@ -324,62 +351,91 @@ useEventListener(document, 'visibilitychange', () => {
           </div>
           <div class="flex flex-wrap gap-5">
             <BaseSwitch v-model="draft.enabled" label="启用打标" show-label />
-            <BaseSwitch v-model="draft.inject" label="业务请求使用有效票" show-label />
+            <BaseSwitch v-model="draft.inject" label="业务请求使用有效票" show-label :disabled="draft.requireTicket" />
           </div>
         </div>
-        <p class="mt-4 text-sm text-cp-text-secondary">
-          长度是可配置的匹配规则，不代表模型能力或质量。未获票时维持原转发；关闭打标的账号不探测、不注入。保存会保留仍符合规则的有效票。
-        </p>
-        <div class="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          <label class="flex flex-col gap-2" for="ticket-plus">Plus / Pro 默认长度<input id="ticket-plus" v-model.number="draft.plusProLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
-          <label class="flex flex-col gap-2" for="ticket-business">Business / Team 默认长度<input id="ticket-business" v-model.number="draft.businessLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
-          <label class="flex flex-col gap-2" for="ticket-default">其他套餐默认长度<input id="ticket-default" v-model.number="draft.defaultLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
-          <label class="flex flex-col gap-2" for="ticket-interval">自动探测间隔（秒）<input id="ticket-interval" v-model.number="draft.intervalSeconds" type="number" min="10" max="86400" step="1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
-          <label class="flex flex-col gap-2" for="ticket-manual-interval">手动探测间隔（秒，0 为无等待）<input id="ticket-manual-interval" v-model.number="draft.manualIntervalSeconds" type="number" min="0" max="86400" step="1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
-          <label class="flex flex-col gap-2" for="ticket-ttl">有效期（秒，最多 3600）<input id="ticket-ttl" v-model.number="draft.ttlSeconds" type="number" min="60" max="3600" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
-          <label class="flex flex-col gap-2" for="ticket-refresh">提前刷新（秒）<input id="ticket-refresh" v-model.number="draft.refreshBeforeSeconds" type="number" min="0" :max="draft.ttlSeconds - 1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+        <div class="mt-4 flex flex-wrap gap-5">
+          <BaseSwitch v-model="draft.activityOnly" label="有调用才自动打票" show-label />
+          <BaseSwitch v-model="draft.requireTicket" label="6 / 5.6 无票禁止调用" show-label />
         </div>
-        <div class="mt-5 grid gap-4 lg:grid-cols-2">
-          <div class="flex flex-col gap-2">
+        <p class="mt-3 text-xs text-cp-text-secondary">
+          {{ draft.activityOnly ? `自动模式：空闲 ${draft.idleSeconds} 秒后休息，有新调用再开始。` : '自动模式：按设定间隔补票。' }}
+          {{ draft.requireTicket ? '本页 OAuth 账号的 6 / 5.6 系列需有效票才能转发；目标模型需加入下方列表。' : '未获票时维持原转发。' }}
+        </p>
+        <p v-if="draft.activityOnly && !autoAccountCount" class="mt-2 text-xs text-cp-warning-text">
+          当前账号未设为自动模式；请在下方选择需要自动补票的账号并保存。
+        </p>
+        <details class="mt-4 rounded-lg bg-cp-fill-quaternary p-3">
+          <summary class="cursor-pointer font-semibold">
+            高级规则与时效
+          </summary>
+          <p class="mt-2 text-xs text-cp-text-secondary">
+            长度是匹配规则，不是官方质量指标。票内时间按 Fernet 格式读取创建时间，未验签，也不能据此推导真实过期时间。
+          </p>
+          <div class="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            <label class="flex flex-col gap-2" for="ticket-idle">空闲暂停（秒）<input id="ticket-idle" v-model.number="draft.idleSeconds" type="number" min="10" max="3600" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+            <label class="flex flex-col gap-2" for="ticket-plus">Plus / Pro 默认长度<input id="ticket-plus" v-model.number="draft.plusProLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+            <label class="flex flex-col gap-2" for="ticket-business">Business / Team 默认长度<input id="ticket-business" v-model.number="draft.businessLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+            <label class="flex flex-col gap-2" for="ticket-default">其他套餐默认长度<input id="ticket-default" v-model.number="draft.defaultLength" type="number" min="64" max="4096" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+            <label class="flex flex-col gap-2" for="ticket-interval">自动探测间隔（秒）<input id="ticket-interval" v-model.number="draft.intervalSeconds" type="number" min="10" max="86400" step="1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+            <label class="flex flex-col gap-2" for="ticket-manual-interval">手动探测间隔（秒，0 为无等待）<input id="ticket-manual-interval" v-model.number="draft.manualIntervalSeconds" type="number" min="0" max="86400" step="1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+            <label class="flex flex-col gap-2" for="ticket-ttl">有效期（秒，最多 3600）<input id="ticket-ttl" v-model.number="draft.ttlSeconds" type="number" min="60" max="3600" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+            <label class="flex flex-col gap-2" for="ticket-refresh">提前刷新（秒）<input id="ticket-refresh" v-model.number="draft.refreshBeforeSeconds" type="number" min="0" :max="draft.ttlSeconds - 1" class="rounded-lg bg-cp-fill-tertiary p-3"></label>
+          </div>
+          <div class="mt-4 flex flex-col gap-2">
             <span>目标模型（逗号分隔）</span><BaseInput id="ticket-models" v-model="models" aria-label="目标模型（逗号分隔）" />
           </div>
-          <label class="flex flex-col gap-2" for="ticket-proxy">
-            <span>批量追加代理</span><textarea id="ticket-proxy" v-model="proxy" aria-label="批量追加代理" autocomplete="off" spellcheck="false" placeholder="每行一个完整代理地址" class="min-h-24 rounded-lg bg-cp-fill-tertiary p-3 font-mono text-sm" :disabled="clearProxy" />
-          </label>
-        </div>
-        <div class="mt-4 flex flex-wrap items-center gap-3">
-          <h3 class="font-semibold">
-            已保存 {{ panel.proxyCount }} 个代理
-          </h3>
-          <BaseSwitch v-model="draft.proxyPoolEnabled" label="启用打标代理池" show-label />
-          <BaseButton :disabled="clearProxy || poolDraft.length >= 64" title="新增代理" aria-label="新增代理" @click="addProxy">
-            <Plus :size="16" />
-          </BaseButton>
-          <BaseButton :disabled="importing" @click="loadSavedProxies">
-            {{ importing ? '读取中…' : '读取 RS 已有代理' }}
-          </BaseButton>
-          <BaseSelect v-if="savedProxies.length" v-model="selectedProxy" :options="savedProxyOptions" aria-label="选择已有代理" class="w-full sm:w-80" />
-          <BaseButton v-if="savedProxies.length" :disabled="!selectedProxy || clearProxy" @click="importProxy">
-            加入打标池
-          </BaseButton>
-        </div>
-        <div v-for="entry in poolDraft" :key="entry.key" class="mt-3 flex flex-wrap items-center gap-3">
-          <BaseSwitch v-model="entry.enabled" :label="`启用 ${entry.name || '代理'}`" :disabled="clearProxy" />
-          <BaseInput v-model="entry.name" aria-label="代理名称" class="w-full sm:w-44" :disabled="clearProxy" />
-          <span class="min-w-0 flex-1 break-all font-mono text-sm">{{ entry.endpoint || '新代理' }} · {{ entry.hasAuthentication ? '已保存认证' : '无已保存认证' }}</span>
-          <BaseInput v-if="!entry.savedProxyId" v-model="entry.url" :aria-label="`${entry.name} 代理地址`" type="password" autocomplete="new-password" :placeholder="entry.id !== undefined ? '留空保留地址及认证；输入完整 URL 替换' : 'socks5://用户名:密码@主机:端口'" class="w-full sm:w-80" :disabled="clearProxy" />
-          <span v-else class="text-sm text-cp-text-secondary">保存时导入认证</span>
-          <BaseSelect :model-value="String(entry.concurrency ?? 1)" :options="[{ label: '并发 1', value: '1' }, { label: '并发 2', value: '2' }, { label: '并发 3', value: '3' }]" :aria-label="`${entry.name} 并发数`" :disabled="clearProxy" class="w-28" @update:model-value="entry.concurrency = Number($event)" />
-          <BaseButton :aria-label="`移除 ${entry.name}`" title="移除代理" :disabled="clearProxy" @click="poolDraft = poolDraft.filter(p => p.key !== entry.key)">
-            <Trash2 :size="16" />
-          </BaseButton>
-        </div>
-        <div class="mt-4">
-          <p class="mb-3 text-sm text-cp-text-secondary">
-            暂停代理池或禁用单个入口会保留配置和已获有效票，已发出的探测会正常结束。并发按代理入口计算，整个服务最多同时 12 个探测。
-          </p>
-          <BaseSwitch v-model="clearProxy" label="清除已保存的代理（需同时关闭打标）" show-label />
-        </div>
+        </details>
+        <details class="mt-3 rounded-lg bg-cp-fill-quaternary p-3" :open="!panel.proxyCount">
+          <summary class="cursor-pointer font-semibold">
+            代理与出口 · {{ panel.proxies.filter(p => p.enabled).length }} / {{ panel.proxyCount }} 已启用
+          </summary>
+          <div class="mt-4">
+            <label class="flex flex-col gap-2" for="ticket-proxy">
+              <span>批量追加代理</span><textarea id="ticket-proxy" v-model="proxy" aria-label="批量追加代理" autocomplete="off" spellcheck="false" placeholder="每行一个完整代理地址" class="min-h-24 rounded-lg bg-cp-fill-tertiary p-3 font-mono text-sm" :disabled="clearProxy" />
+            </label>
+          </div>
+          <div class="mt-4 flex flex-wrap items-center gap-3">
+            <h3 class="font-semibold">
+              已保存 {{ panel.proxyCount }} 个代理
+            </h3>
+            <BaseSwitch v-model="draft.proxyPoolEnabled" label="启用打标代理池" show-label />
+            <BaseButton :disabled="clearProxy || poolDraft.length >= 64" title="新增代理" aria-label="新增代理" @click="addProxy">
+              <Plus :size="16" />
+            </BaseButton>
+            <BaseButton :disabled="importing" @click="loadSavedProxies">
+              {{ importing ? '读取中…' : '读取 RS 已有代理' }}
+            </BaseButton>
+            <BaseSelect v-if="savedProxies.length" v-model="selectedProxy" :options="savedProxyOptions" aria-label="选择已有代理" class="w-full sm:w-80" />
+            <BaseButton v-if="savedProxies.length" :disabled="!selectedProxy || clearProxy" @click="importProxy">
+              加入打标池
+            </BaseButton>
+          </div>
+          <div v-for="entry in poolDraft" :key="entry.key" class="mt-3 flex flex-wrap items-center gap-3">
+            <BaseSwitch v-model="entry.enabled" :label="`启用 ${entry.name || '代理'}`" :disabled="clearProxy" />
+            <BaseInput v-model="entry.name" aria-label="代理名称" class="w-full sm:w-44" :disabled="clearProxy" />
+            <span class="min-w-0 flex-1 break-all font-mono text-sm">{{ entry.endpoint || '新代理' }} · {{ entry.hasAuthentication ? '已保存认证' : '无已保存认证' }}</span>
+            <BaseInput v-if="!entry.savedProxyId" v-model="entry.url" :aria-label="`${entry.name} 代理地址`" type="password" autocomplete="new-password" :placeholder="entry.id !== undefined ? '留空保留地址及认证；输入完整 URL 替换' : 'socks5://用户名:密码@主机:端口'" class="w-full sm:w-80" :disabled="clearProxy" />
+            <span v-else class="text-sm text-cp-text-secondary">保存时导入认证</span>
+            <BaseSelect :model-value="String(entry.concurrency ?? 1)" :options="[{ label: '并发 1', value: '1' }, { label: '并发 2', value: '2' }, { label: '并发 3', value: '3' }]" :aria-label="`${entry.name} 并发数`" :disabled="clearProxy" class="w-28" @update:model-value="entry.concurrency = Number($event)" />
+            <BaseButton :aria-label="`检测 ${entry.name} 出口 IP`" :disabled="entry.id === undefined || !!samplingExit || saving || draftRevision !== panel.revision || !!entry.url?.trim()" @click="sampleExit(entry.id!)">
+              {{ samplingExit === entry.id ? '检测中…' : '检测出口 IP' }}
+            </BaseButton>
+            <span v-if="exitSamples.get(entry.id ?? '')" class="w-full text-xs text-cp-text-secondary">
+              出口采样：{{ exitSamples.get(entry.id ?? '')?.ip || exitSamples.get(entry.id ?? '')?.message }} · {{ time(exitSamples.get(entry.id ?? '')?.checkedAt) }}
+              {{ (exitSamples.get(entry.id ?? '')?.checkedAt ?? 0) + 600 <= clock.getTime() / 1000 ? '（采样已过期）' : '（独立连接，非本次打标确认）' }}
+            </span>
+            <BaseButton :aria-label="`移除 ${entry.name}`" title="移除代理" :disabled="clearProxy" @click="poolDraft = poolDraft.filter(p => p.key !== entry.key)">
+              <Trash2 :size="16" />
+            </BaseButton>
+          </div>
+          <div class="mt-4">
+            <p class="mb-3 text-sm text-cp-text-secondary">
+              暂停代理池或禁用单个入口会保留配置和已获有效票，已发出的探测会正常结束。并发按代理入口计算，整个服务最多同时 12 个探测。
+            </p>
+            <BaseSwitch v-model="clearProxy" label="清除已保存的代理（需同时关闭打标）" show-label />
+          </div>
+        </details>
       </BaseCard>
       <BaseCard class="p-5">
         <div class="mb-5 flex flex-wrap items-center justify-between gap-4">
@@ -389,8 +445,7 @@ useEventListener(document, 'visibilitychange', () => {
           <BaseInput v-model="search" aria-label="搜索账号" placeholder="搜索账号、套餐或 ID" class="w-full sm:w-72" />
         </div>
         <p class="mb-4 text-sm text-cp-text-secondary">
-          修改模式后先保存。手动探测可指定代理或从池内轮换；持续打标按间隔重复，命中即停，也可随时停止。限流会退避。刷新会放弃未保存草稿，持续任务继续运行。
-          后台最近检查：{{ time(panel.workerCheckedAt) }}。
+          模式变更需保存；持续模式按入口并发配置探测，命中后停止。后台检查：{{ time(panel.workerCheckedAt) }}。
         </p>
         <p v-if="!rows.length" class="py-8 text-center text-cp-text-secondary">
           暂无匹配的 OAuth 账号
@@ -414,22 +469,36 @@ useEventListener(document, 'visibilitychange', () => {
               <div v-for="status in account.models" :key="status.model" class="rounded-lg p-4" :class="status.ready ? 'bg-cp-success-container' : 'bg-cp-bg-container'">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <span class="font-mono text-sm">{{ status.model }}</span>
-                  <BaseTag :type="status.ready ? 'success' : 'neutral'" round>
-                    {{ status.ready ? '✓ 已打到 · 有效票' : '暂无有效票' }}
+                  <BaseTag :type="status.ready ? 'success' : status.blocked ? 'warning' : 'neutral'" round>
+                    {{ status.ready ? '✓ 已打到 · 有效票' : status.blocked ? '无票 · 调用拦截' : '暂无有效票' }}
                   </BaseTag>
                 </div>
                 <p class="mt-2 text-sm text-cp-text-secondary">
                   最近：{{ status.lastResult ? `HTTP ${status.lastResult.httpStatus} / 长度 ${status.lastResult.length}` : '尚未探测' }}
                 </p>
                 <p class="mt-1 text-xs text-cp-text-secondary">
-                  到期：{{ time(status.expiresAt) }}<span v-if="status.manualRetryAt"> · 下次可手动探测：{{ time(status.manualRetryAt) }}</span>
+                  本地到期：{{ time(status.expiresAt) }}<span v-if="status.manualRetryAt"> · 下次可手动探测：{{ time(status.manualRetryAt) }}</span>
                 </p>
+                <p v-if="account.policy.mode === 'auto' && panel.settings.activityOnly" class="mt-1 text-xs text-cp-text-secondary">
+                  {{ status.autoPaused ? '自动休息 · 等待业务调用' : '近期有调用 · 自动补票已激活' }}
+                </p>
+                <details v-if="status.tokenIssuedAt || status.lastRequestedAt" class="mt-2 text-xs text-cp-text-secondary">
+                  <summary class="cursor-pointer">
+                    票据时间与最近调用
+                  </summary>
+                  <p class="mt-1">
+                    票内创建时间（未验签）：{{ time(status.tokenIssuedAt) }}
+                  </p>
+                  <p class="mt-1">
+                    最近调用：{{ time(status.lastRequestedAt) }}
+                  </p>
+                </details>
                 <div class="mt-3 flex flex-wrap gap-3">
                   <BaseSelect :model-value="status.continuous ? (status.continuous.proxyId ?? 'pool') : (manualProxies[`${account.id}/${status.model}`] ?? 'pool')" :options="manualProxyOptions" :disabled="!!status.continuous || status.busy" :aria-label="`${account.name} ${status.model} 手动代理`" class="min-w-40 flex-1" @update:model-value="manualProxies[`${account.id}/${status.model}`] = $event" />
                   <BaseInput :model-value="status.continuous?.intervalSeconds.toString() ?? continuousIntervals[`${account.id}/${status.model}`] ?? '10'" :disabled="!!status.continuous" :aria-label="`${account.name} ${status.model} 持续间隔（秒）`" type="number" min="10" max="86400" class="w-28" @update:model-value="continuousIntervals[`${account.id}/${status.model}`] = String($event)" />
                 </div>
                 <p class="mt-1 text-xs text-cp-text-secondary">
-                  持续间隔（秒），默认 10；每轮按入口并发设置同时发起，完成后等待，命中自动停止。
+                  右侧为批次间隔（秒），默认 10。
                 </p>
                 <div class="mt-3 flex flex-wrap gap-2">
                   <BaseButton :disabled="!!probing || saving || !!controlling || !!status.continuous || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
@@ -466,7 +535,7 @@ useEventListener(document, 'visibilitychange', () => {
           </div>
         </div>
         <p class="mt-2 text-sm text-cp-text-secondary">
-          代理地址不等于真实出口 IP；动态代理的出口 IP 未确认。日志从本次升级后开始记录。
+          出口 IP 是独立连接采样，不是本次打标的出口证明；在代理设置中按需检测，缓存 10 分钟。
         </p>
         <p class="mt-2 text-xs text-cp-text-secondary" role="status">
           {{ statusRefreshFailed ? '状态刷新失败，请点击刷新记录重试。' : `最近刷新：${time(lastStatusRefresh)}` }}
@@ -478,36 +547,41 @@ useEventListener(document, 'visibilitychange', () => {
         <BaseButton v-if="pendingNewLogs || logSearch || logOutcome !== 'all' || logPage > 1" class="mt-2" @click="showLatestLogs">
           {{ pendingNewLogs ? '有新记录，查看最新' : '清除筛选并查看最新' }}
         </BaseButton>
-        <div v-if="proxyStats.length" class="mt-4 overflow-x-auto">
-          <table class="w-full text-left text-sm">
-            <thead>
-              <tr>
-                <th class="p-2">
-                  代理地址
-                </th><th class="p-2">
-                  次数
-                </th><th class="p-2">
-                  命中
-                </th><th class="p-2">
-                  命中率
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="item in proxyStats" :key="item.endpoint">
-                <td class="break-all p-2 font-mono">
-                  {{ item.endpoint }}
-                </td><td class="p-2">
-                  {{ item.count }}
-                </td><td class="p-2">
-                  {{ item.matched }}
-                </td><td class="p-2">
-                  {{ (100 * item.matched / item.count).toFixed(1) }}%
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
+        <details v-if="proxyStats.length" class="mt-3">
+          <summary class="cursor-pointer text-sm text-cp-text-secondary">
+            代理命中统计
+          </summary>
+          <div class="mt-2 overflow-x-auto">
+            <table class="w-full text-left text-sm">
+              <thead>
+                <tr>
+                  <th class="p-2">
+                    代理地址
+                  </th><th class="p-2">
+                    次数
+                  </th><th class="p-2">
+                    命中
+                  </th><th class="p-2">
+                    命中率
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="item in proxyStats" :key="item.endpoint">
+                  <td class="break-all p-2 font-mono">
+                    {{ item.endpoint }}
+                  </td><td class="p-2">
+                    {{ item.count }}
+                  </td><td class="p-2">
+                    {{ item.matched }}
+                  </td><td class="p-2">
+                    {{ (100 * item.matched / item.count).toFixed(1) }}%
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
         <div class="my-4 flex flex-wrap gap-3">
           <BaseInput v-model="logSearch" aria-label="搜索打标日志" placeholder="账号、模型、代理 IP 或状态" class="w-full sm:w-80" />
           <BaseSelect v-model="logOutcome" :options="logOptions" aria-label="打标日志结果筛选" class="w-44" />
@@ -553,6 +627,9 @@ useEventListener(document, 'visibilitychange', () => {
                     {{ log.proxyName }}
                   </div>
                   {{ log.proxyEndpoint }}
+                  <div v-if="log.exitSample?.ip" class="mt-1 font-sans text-cp-text-secondary">
+                    采样 IP：{{ log.exitSample.ip }}<br>{{ time(log.exitSample.checkedAt) }}（非本次确认）
+                  </div>
                 </td>
                 <td class="p-3 align-top">
                   {{ log.result.httpStatus || '无响应' }}<div class="mt-1">
@@ -567,11 +644,15 @@ useEventListener(document, 'visibilitychange', () => {
                   </div>
                 </td>
                 <td class="max-w-80 break-words p-3 align-top">
-                  {{ log.result.message }}<div v-if="log.retryAt" class="mt-1 text-xs">
+                  {{ log.result.message }}<div v-if="log.tokenIssuedAt" class="mt-1 text-xs">
+                    票内创建：{{ time(log.tokenIssuedAt) }}（未验签）
+                  </div><div v-if="log.retryAt" class="mt-1 text-xs">
                     自动退避至 {{ time(log.retryAt) }}
-                  </div><div class="mt-1 break-all font-mono text-xs text-cp-text-tertiary">
-                    {{ log.id }}
-                  </div>
+                  </div><details class="mt-1 text-xs text-cp-text-tertiary">
+                    <summary class="cursor-pointer">
+                      记录编号
+                    </summary><span class="break-all font-mono">{{ log.id }}</span>
+                  </details>
                 </td>
               </tr>
             </tbody>

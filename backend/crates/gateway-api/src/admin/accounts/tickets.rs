@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::auth::SessionState;
-use gateway_admin::model::tickets::{TicketContinuousInput, TicketProbe, TicketUpdate};
+use gateway_admin::model::tickets::{
+    TicketContinuousInput, TicketExitProbe, TicketProbe, TicketUpdate,
+};
 
 pub(super) fn router<S>() -> Router<S>
 where
@@ -13,6 +15,7 @@ where
         .route("/api/admin/tickets/probe", post(probe::<S>))
         .route("/api/admin/tickets/continuous", post(continuous::<S>))
         .route("/api/admin/tickets/logs/clear", post(clear_logs::<S>))
+        .route("/api/admin/tickets/proxy-exit", post(exit_sample::<S>))
 }
 
 async fn panel<S>(_auth: AdminAuth, State(state): State<S>) -> Result<impl IntoResponse, AdminError>
@@ -39,6 +42,23 @@ where
         .admin_services()
         .accounts()
         .clear_ticket_logs(&auth.context().mutation_context())
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
+}
+
+async fn exit_sample<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(input): AdminJson<TicketExitProbe>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let data = state
+        .admin_services()
+        .accounts()
+        .ticket_exit_sample(input)
         .await
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))

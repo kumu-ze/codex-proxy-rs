@@ -72,6 +72,12 @@ pub trait AccountsService: Send + Sync {
         Err(AdminError::invalid("当前版本不支持持续打标"))
     }
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError>;
+    async fn ticket_exit_sample(
+        &self,
+        _input: crate::model::tickets::TicketExitProbe,
+    ) -> Result<crate::model::tickets::TicketExitSample, AdminError> {
+        Err(AdminError::invalid("当前版本不支持出口采样"))
+    }
     async fn clear_ticket_logs(
         &self,
         _context: &MutationContext,
@@ -791,6 +797,20 @@ impl AccountsService for DefaultAccountsService {
             .map_err(|e| map_provider_error(e, "clear ticket logs"))?;
         tracing::info!(actor = ?context.actor, request_id = %context.request_id, "管理员清理打标记录");
         Ok(panel)
+    }
+
+    async fn ticket_exit_sample(
+        &self,
+        input: crate::model::tickets::TicketExitProbe,
+    ) -> Result<crate::model::tickets::TicketExitSample, AdminError> {
+        let kind =
+            ProviderKind::new("openai").map_err(|_| AdminError::internal("Provider 无效"))?;
+        self.providers
+            .require(&kind)
+            .map_err(|e| map_provider_error(e, "ticket provider"))?
+            .ticket_exit_sample(input)
+            .await
+            .map_err(|e| map_provider_error(e, "ticket exit sample"))
     }
 
     async fn account_configuration(

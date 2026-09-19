@@ -26,6 +26,12 @@ pub struct TicketSettings {
     pub inject: bool,
     #[serde(default = "default_pool_enabled")]
     pub proxy_pool_enabled: bool,
+    #[serde(default)]
+    pub activity_only: bool,
+    #[serde(default = "default_idle_seconds")]
+    pub idle_seconds: u64,
+    #[serde(default)]
+    pub require_ticket: bool,
     pub plus_pro_length: usize,
     pub business_length: usize,
     pub default_length: usize,
@@ -44,6 +50,9 @@ impl Default for TicketSettings {
             enabled: false,
             inject: false,
             proxy_pool_enabled: true,
+            activity_only: false,
+            idle_seconds: default_idle_seconds(),
+            require_ticket: false,
             plus_pro_length: 292,
             business_length: 332,
             default_length: 292,
@@ -59,6 +68,10 @@ impl Default for TicketSettings {
 
 fn default_pool_enabled() -> bool {
     true
+}
+
+const fn default_idle_seconds() -> u64 {
+    120
 }
 
 impl TicketSettings {
@@ -81,6 +94,8 @@ impl TicketSettings {
             && length_ok(self.default_length)
             && (10..=86400).contains(&self.interval_seconds)
             && self.manual_interval_seconds <= 86400
+            && (10..=3600).contains(&self.idle_seconds)
+            && (!self.require_ticket || self.inject)
             && (60..=3600).contains(&self.ttl_seconds)
             && self.refresh_before_seconds < self.ttl_seconds
             && !self.models.is_empty()
@@ -135,6 +150,25 @@ pub struct TicketLog {
     pub duration_ms: u64,
     pub retry_at: Option<u64>,
     pub result: TicketResult,
+    #[serde(default)]
+    pub token_issued_at: Option<u64>,
+    #[serde(default)]
+    pub exit_sample: Option<TicketExitSample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketExitSample {
+    pub ip: Option<std::net::IpAddr>,
+    pub checked_at: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TicketExitProbe {
+    pub revision: u64,
+    pub proxy_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +194,10 @@ pub struct TicketModelStatus {
     pub retry_at: Option<u64>,
     pub manual_retry_at: Option<u64>,
     pub continuous: Option<TicketContinuousStatus>,
+    pub token_issued_at: Option<u64>,
+    pub last_requested_at: Option<u64>,
+    pub auto_paused: bool,
+    pub blocked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +244,7 @@ pub struct TicketProxyView {
     pub enabled: bool,
     pub concurrency: usize,
     pub in_flight: usize,
+    pub exit_sample: Option<TicketExitSample>,
 }
 
 // URL 只允许写入，不派生 Debug；旧条目凭 revision + id 保留认证。
