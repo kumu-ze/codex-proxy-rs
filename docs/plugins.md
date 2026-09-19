@@ -72,7 +72,8 @@ iframe 通过 `parent.postMessage({type: 'rs-plugin-call', id: '唯一请求ID',
 ## 请求扩展原型
 
 manifest 可声明 `capabilities: ["request.openai"]`，在实际账号选择与身份清理后接收 `request.before_send`。
-参数包含 provider、accountId、model、credentialScope，不包含请求正文或认证材料。
+参数包含 provider、accountId、model、credentialScope、authenticationKind、planType 和 accountEligible，不包含请求正文或认证材料。
+authenticationKind 和 planType 来自选定账号，accountEligible 表示账号已启用且凭据状态为 Ready；插件不能自行提升这些状态。
 credentialScope 由 Provider 按账号和认证材料计算；OAuth 同时绑定上游账号、用户及 AT/RT/ID Token。
 名称、套餐与非认证配置的 revision 更新不改变绑定，重新授权或身份变化则使旧状态失效。
 插件返回 `{ "deny": false, "values": { "session_state": "..." } }`。当前 OpenAI adapter 仅允许 session_state 字段，并校验大小与字符集。

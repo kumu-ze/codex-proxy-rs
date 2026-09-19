@@ -566,6 +566,11 @@ impl Provider for CodexProvider {
                 account_id: lease.account_id().as_str().into(),
                 model: upstream_model.as_str().into(),
                 credential_scope: lease.authentication().extension_scope(lease.account()),
+                authentication_kind: lease.account().authentication_kind().into(),
+                plan_type: lease.account().plan_type().map(str::to_owned),
+                account_eligible: lease.account().enabled()
+                    && lease.account().credential_state()
+                        == gateway_core::account::CredentialState::Ready,
             };
             let decision = extension.before_send(request).await.map_err(|_| {
                 provider_error(

@@ -11,6 +11,9 @@ pub struct ExtensionRequest {
     pub account_id: String,
     pub model: String,
     pub credential_scope: String,
+    pub authentication_kind: String,
+    pub plan_type: Option<String>,
+    pub account_eligible: bool,
 }
 
 /// Provider 决定允许哪些字段；扩展不能任意覆盖请求头、认证或模型。
