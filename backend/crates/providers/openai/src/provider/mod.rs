@@ -561,24 +561,11 @@ impl Provider for CodexProvider {
         );
         if let Some(extension) = &self.extension {
             use gateway_core::engine::extensions::ExtensionRequest;
-            use sha2::{Digest as _, Sha256};
-            // 扩展仅得到不可逆身份摘要，不能读取认证材料；换号或换凭据使作用域变化。
-            let mut hash = Sha256::new();
-            let account_id = lease.account_id().as_str();
-            hash.update((account_id.len() as u64).to_be_bytes());
-            hash.update(account_id.as_bytes());
-            if let Some(auth) = lease.authentication().oauth() {
-                let token = auth.access_token.expose_secret();
-                hash.update((token.len() as u64).to_be_bytes());
-                hash.update(token.as_bytes());
-            } else {
-                hash.update(lease.account().revision().get().to_be_bytes());
-            }
             let request = ExtensionRequest {
                 provider: "openai".into(),
                 account_id: lease.account_id().as_str().into(),
                 model: upstream_model.as_str().into(),
-                credential_scope: hex::encode(hash.finalize()),
+                credential_scope: lease.authentication().extension_scope(lease.account()),
             };
             let decision = extension.before_send(request).await.map_err(|_| {
                 provider_error(

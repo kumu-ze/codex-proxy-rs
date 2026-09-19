@@ -59,12 +59,12 @@ impl PluginRegistry {
         if configs.len() > 16 {
             return Err(PluginError::InvalidPackage);
         }
-        let mut entries = BTreeMap::new();
-        let mut directories = std::collections::BTreeSet::new();
+        let mut prepared = Vec::new();
+        let mut ids = std::collections::BTreeSet::new();
         for config in configs {
             let package = PluginPackage::open(&config.directory)?;
             let id = package.manifest().id.clone();
-            if entries.contains_key(&id) {
+            if !ids.insert(id) {
                 return Err(PluginError::InvalidPackage);
             }
             std::fs::create_dir_all(&config.data_directory).map_err(|_| PluginError::Io)?;
@@ -72,15 +72,27 @@ impl PluginRegistry {
                 .data_directory
                 .canonicalize()
                 .map_err(|_| PluginError::Io)?;
-            if data.starts_with(package.root())
-                || package.root().starts_with(&data)
-                || !directories.insert(data.clone())
-            {
+            if data.starts_with(package.root()) || package.root().starts_with(&data) {
                 return Err(PluginError::InvalidPackage);
             }
+            prepared.push((package, data));
+        }
+        // 在启动任何代码之前核对所有目录，禁止一个插件的数据覆盖另一个插件的程序或数据。
+        for (index, (package, data)) in prepared.iter().enumerate() {
+            for (other_package, other_data) in prepared.iter().skip(index + 1) {
+                if overlaps(data, other_data)
+                    || overlaps(data, other_package.root())
+                    || overlaps(package.root(), other_data)
+                {
+                    return Err(PluginError::InvalidPackage);
+                }
+            }
+        }
+        let mut entries = BTreeMap::new();
+        for (package, data) in prepared {
             let process = PluginProcess::start(&package, &data, Duration::from_secs(5)).await?;
             entries.insert(
-                id,
+                package.manifest().id.clone(),
                 Entry {
                     admission: Semaphore::new(16),
                     request_openai: package
@@ -98,15 +110,23 @@ impl PluginRegistry {
     }
 
     pub async fn shutdown(&self) {
+        // 同时关闭所有入口，退出预算不随插件数量累加。
         for entry in self.entries.values() {
             entry.available.store(false, Ordering::Release);
+        }
+        futures::future::join_all(self.entries.values().map(|entry| async move {
             if let Ok(mut process) =
                 tokio::time::timeout(Duration::from_secs(6), entry.process.lock()).await
             {
                 let _ = process.stop().await;
             }
-        }
+        }))
+        .await;
     }
+}
+
+fn overlaps(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 #[async_trait]
@@ -132,6 +152,9 @@ impl RequestExtension for PluginRegistry {
                 tokio::time::timeout(Duration::from_millis(500), entry.process.lock())
                     .await
                     .map_err(|_| ExtensionUnavailable)?;
+            if !entry.available.load(Ordering::Acquire) {
+                return Err(ExtensionUnavailable);
+            }
             let result = process
                 .call(
                     "request.before_send",
@@ -170,10 +193,18 @@ impl PluginOperations for PluginRegistry {
     async fn list(&self) -> Vec<PluginStatus> {
         self.entries
             .iter()
-            .map(|(id, entry)| PluginStatus {
-                id: id.clone(),
-                version: entry.version.clone(),
-                available: entry.available.load(Ordering::Acquire),
+            .map(|(id, entry)| {
+                // 忙碌不是故障；空闲时回收已退出或被取消的进程状态。
+                if let Ok(mut process) = entry.process.try_lock()
+                    && !process.is_available()
+                {
+                    entry.available.store(false, Ordering::Release);
+                }
+                PluginStatus {
+                    id: id.clone(),
+                    version: entry.version.clone(),
+                    available: entry.available.load(Ordering::Acquire),
+                }
             })
             .collect()
     }
@@ -202,6 +233,9 @@ impl PluginOperations for PluginRegistry {
             .process
             .try_lock()
             .map_err(|_| PluginOperationError::Unavailable)?;
+        if !entry.available.load(Ordering::Acquire) {
+            return Err(PluginOperationError::Unavailable);
+        }
         let result = process.call(method, input, Duration::from_secs(5)).await;
         if result.is_err() {
             entry.available.store(false, Ordering::Release);

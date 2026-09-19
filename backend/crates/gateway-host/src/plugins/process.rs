@@ -133,6 +133,16 @@ impl PluginProcess {
 
     pub async fn stop(&mut self) -> Result<(), PluginError> {
         self.stopped = true;
-        self.child.kill().await.map_err(|_| PluginError::Io)
+        self.child.start_kill().map_err(|_| PluginError::Io)?;
+        tokio::time::timeout(Duration::from_secs(1), self.child.wait())
+            .await
+            .map_err(|_| PluginError::Timeout)?
+            .map_err(|_| PluginError::Io)?;
+        Ok(())
+    }
+
+    /// 在取得通信锁后查询；取消留下的半帧与已退出进程都不能再接收调用。
+    pub fn is_available(&mut self) -> bool {
+        !self.stopped && !self.pending && matches!(self.child.try_wait(), Ok(None))
     }
 }
