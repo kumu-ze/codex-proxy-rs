@@ -16,6 +16,11 @@ export const routes: RouteRecordRaw[] = [
     component: () => import('@/layout/index.vue'),
     children: [
       {
+        path: 'plugins',
+        name: 'plugins',
+        component: () => import('@/views/plugins/index.vue'),
+      },
+      {
         path: '',
         name: 'dashboard',
         component: () => import('@/views/dashboard/index.vue'),

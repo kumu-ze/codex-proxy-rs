@@ -182,6 +182,7 @@ pub enum AdminConfigError {
 /// 字段全部私有；调用方经 accessor 直接调用能力，不需要命名内部 `use_case` 模块。
 #[derive(Clone)]
 pub struct AdminServices {
+    plugins: Option<Arc<dyn ports::plugins::PluginOperations>>,
     proxies: Arc<dyn ProxiesService>,
     auth: Arc<dyn AuthService>,
     key_usage: Arc<dyn KeyUsageService>,
@@ -199,6 +200,16 @@ pub struct AdminServices {
 }
 
 impl AdminServices {
+    #[must_use]
+    pub fn with_plugins(mut self, plugins: Arc<dyn ports::plugins::PluginOperations>) -> Self {
+        self.plugins = Some(plugins);
+        self
+    }
+
+    #[must_use]
+    pub fn plugins(&self) -> Option<&dyn ports::plugins::PluginOperations> {
+        self.plugins.as_deref()
+    }
     #[must_use]
     pub fn import_tasks(&self) -> &dyn ImportTasksService {
         self.import_tasks.as_ref()
@@ -391,6 +402,7 @@ pub async fn initialize(
         use_case::import_tasks::DefaultImportTasksService::new(openai.clone(), xai.clone());
     let import_task = use_case::import_tasks::ImportTaskWorker(import_tasks.clone());
     let services = AdminServices {
+        plugins: None,
         key_usage,
         proxies: Arc::new(use_case::proxies::DefaultProxiesService::new(
             store.proxies(),

@@ -17,6 +17,7 @@ pub mod backups;
 pub mod client_keys;
 mod extract;
 pub mod observability;
+mod plugins;
 pub mod presenter;
 pub mod proxies;
 pub mod settings;
@@ -44,6 +45,7 @@ where
         .merge(observability::router::<S>())
         .merge(settings::router::<S>())
         .merge(system::router::<S>())
+        .merge(plugins::router::<S>())
         .method_not_allowed_fallback(method_not_allowed)
         .route("/api/admin", any(admin_not_found))
         .route("/api/admin/{*path}", any(admin_not_found))

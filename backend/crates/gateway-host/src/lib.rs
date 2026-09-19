@@ -3,6 +3,7 @@
 pub mod client_distribution;
 pub mod config;
 mod logging;
+pub mod plugins;
 pub mod pricing;
 pub mod proxy_probe;
 pub mod serve;

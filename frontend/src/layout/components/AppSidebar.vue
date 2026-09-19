@@ -12,6 +12,7 @@ import {
   Palette,
   PanelLeftClose,
   PanelLeftOpen,
+  Puzzle,
   Settings,
   Sun,
   Users,
@@ -66,6 +67,7 @@ const navItems = [
   { label: '使用统计', icon: ChartNoAxesColumn, path: '/usage' },
   { label: '主题设置', icon: Palette, path: '/theme' },
   { label: '系统设置', icon: Settings, path: '/settings' },
+  { label: '插件', icon: Puzzle, path: '/plugins' },
 ]
 
 function isActive(path: string) {

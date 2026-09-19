@@ -2323,3 +2323,96 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         ProviderAdminErrorKind::Unsupported
     );
 }
+
+struct TestRequestExtension;
+#[async_trait::async_trait]
+impl gateway_core::engine::extensions::RequestExtension for TestRequestExtension {
+    async fn before_send(
+        &self,
+        request: gateway_core::engine::extensions::ExtensionRequest,
+    ) -> Result<
+        gateway_core::engine::extensions::ExtensionDecision,
+        gateway_core::engine::extensions::ExtensionUnavailable,
+    > {
+        assert_eq!(request.account_id, "acct_extension");
+        assert_eq!(request.model, "gpt-5.4");
+        assert_eq!(request.credential_scope.len(), 64);
+        assert!(!request.credential_scope.contains("at-extension-secret"));
+        Ok(gateway_core::engine::extensions::ExtensionDecision {
+            deny: false,
+            values: BTreeMap::from([("session_state".into(), "extension-state".into())]),
+        })
+    }
+}
+
+#[tokio::test]
+async fn extension_state_is_applied_after_account_scoping() {
+    let id = "acct_extension";
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: id.into(),
+            name: id.into(),
+            secret: secret("at-extension-secret"),
+            verified_account: profile("chatgpt-extension"),
+            next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+            enabled: true,
+        })
+        .await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(wiremock::matchers::header(
+            "x-codex-turn-state",
+            "extension-state",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(COMPLETED_SESSION_SSE),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut config = valid_config();
+    config.config.api.base_url = server.uri();
+    let bundle = provider_openai::initialize_with_extension(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+        Some(Arc::new(TestRequestExtension)),
+    )
+    .await
+    .unwrap();
+    let payload = ProtocolPayload::json_object(
+        "openai",
+        json!({"model":"gpt-5.4","input":"hello","client_metadata":{"x-codex-turn-state":"old"}})
+            .as_object()
+            .unwrap()
+            .clone(),
+    )
+    .unwrap()
+    .with_context(Map::from_iter([("use_websocket".into(), json!(false))]));
+    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
+    let mut stream = bundle
+        .core_provider()
+        .execute(
+            initialized_provider_request(operation, id),
+            initialized_attempt_context("req_extension_test", id),
+        )
+        .await
+        .unwrap();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    let requests = server.received_requests().await.unwrap();
+    let request = requests
+        .iter()
+        .find(|r| r.url.path() == "/codex/responses")
+        .unwrap();
+    let decoded = zstd::stream::decode_all(request.body.as_slice()).unwrap();
+    let body: Value = serde_json::from_slice(&decoded).unwrap();
+    assert_eq!(
+        body["client_metadata"]["x-codex-turn-state"],
+        "extension-state"
+    );
+}

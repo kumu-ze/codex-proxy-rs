@@ -1,0 +1,61 @@
+//! 固定的插件管理入口；插件不能注册或覆盖宿主路由。
+
+use axum::{
+    Router,
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+};
+use gateway_admin::ports::plugins::PluginOperationError;
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::{AdminAuth, AdminEnvelope, AdminError, AdminJson, AdminResponse};
+use crate::auth::SessionState;
+
+pub(super) fn router<S: SessionState + Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new()
+        .route("/api/admin/plugins", get(list::<S>))
+        .route("/api/admin/plugins/invoke", post(invoke::<S>))
+}
+
+async fn list<S: SessionState + Send + Sync>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> impl IntoResponse {
+    let services = state.admin_services();
+    let data = match services.plugins() {
+        Some(plugins) => plugins.list().await,
+        None => Vec::new(),
+    };
+    AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Invocation {
+    id: String,
+    method: String,
+    input: Value,
+}
+
+async fn invoke<S: SessionState + Send + Sync>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(body): AdminJson<Invocation>,
+) -> Result<impl IntoResponse, AdminError> {
+    let services = state.admin_services();
+    let plugins = services
+        .plugins()
+        .ok_or_else(AdminError::service_unavailable)?;
+    let data = plugins
+        .invoke(&body.id, &body.method, body.input)
+        .await
+        .map_err(|error| match error {
+            PluginOperationError::NotFound => AdminError::not_found("插件不存在"),
+            PluginOperationError::Invalid => AdminError::bad_request("插件操作无效"),
+            PluginOperationError::Unavailable => AdminError::service_unavailable(),
+        })?;
+    Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
+}

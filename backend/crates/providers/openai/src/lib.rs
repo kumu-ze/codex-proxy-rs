@@ -54,6 +54,14 @@ pub async fn initialize(
     config: OpenAiConfig,
     ports: ProviderStorePorts,
 ) -> Result<ProviderBundle, OpenAiInitializeError> {
+    initialize_with_extension(config, ports, None).await
+}
+
+pub async fn initialize_with_extension(
+    config: OpenAiConfig,
+    ports: ProviderStorePorts,
+    extension: Option<Arc<dyn gateway_core::engine::extensions::RequestExtension>>,
+) -> Result<ProviderBundle, OpenAiInitializeError> {
     let provider_kind =
         ProviderKind::new("openai").map_err(|_| OpenAiInitializeError::InvalidProviderKind)?;
     let accounts: Arc<dyn ProviderAccountStore> = ports.accounts();
@@ -178,7 +186,8 @@ pub async fn initialize(
             config.stream_max_retries(),
         )
         .map_err(OpenAiInitializeError::Provider)?
-        .with_session_identity(session_identity),
+        .with_session_identity(session_identity)
+        .with_extension(extension),
     );
     let token_client = Arc::new(
         credential::token_client::openai_token_client(

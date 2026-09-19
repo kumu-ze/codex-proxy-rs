@@ -11,9 +11,29 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             runtime()?.block_on(codex_proxy_rs::bootstrap::run())?;
             Ok(())
         }
-        Some(command) => {
-            Err(invalid_cli(&format!("unknown command {command:?}; expected serve")).into())
+        Some("plugin-install") => {
+            let source = arguments
+                .next()
+                .ok_or_else(|| invalid_cli("expected package directory"))?;
+            let destination = arguments
+                .next()
+                .ok_or_else(|| invalid_cli("expected install directory"))?;
+            reject_extra_arguments(arguments)?;
+            let package = gateway_host::plugins::install_package(
+                std::path::Path::new(&source),
+                std::path::Path::new(&destination),
+            )?;
+            println!(
+                "Installed {} {} (not enabled)",
+                package.manifest().id,
+                package.manifest().version
+            );
+            Ok(())
         }
+        Some(command) => Err(invalid_cli(&format!(
+            "unknown command {command:?}; expected serve or plugin-install"
+        ))
+        .into()),
     }
 }
 
