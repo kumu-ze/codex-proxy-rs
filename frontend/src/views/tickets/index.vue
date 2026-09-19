@@ -173,7 +173,7 @@ async function save() {
   generation += 1
   try {
     accept(await saveTicketSettings({ revision: draftRevision.value, settings, proxies: clearProxy.value ? [] : proxies }))
-    toast.success('策略已保存，旧票已失效；后续按新规则打标')
+    toast.success('策略已保存，仍符合规则的有效票已保留')
   }
   catch {}
   finally { saving.value = false }

@@ -1,7 +1,7 @@
 //! Provider-owned 打标：后台探测、私有持久化及按账号/模型隔离的注入。
 
 use crate::{
-    credential::CodexCredentialRepository,
+    credential::{CodexCredentialRepository, CodexRuntimeAuthentication},
     transport::{CODEX_RESPONSES_PATH, endpoint_url, profile::CodexWireProfileState},
 };
 use futures::future::BoxFuture;
@@ -16,13 +16,14 @@ use gateway_core::{
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 
 const HEADER: &str = "x-codex-turn-state";
 const LOG_LIMIT: usize = 1000;
@@ -31,6 +32,8 @@ const LOG_LIMIT: usize = 1000;
 struct Ticket {
     account_id: String,
     credential_revision: u64,
+    #[serde(default)]
+    auth_binding: Option<String>,
     model: String,
     state: String,
     expires_at: u64,
@@ -97,9 +100,9 @@ pub(crate) struct TicketService {
     profile: CodexWireProfileState,
     url: String,
     path: PathBuf,
-    data: Mutex<Persisted>,
+    data: Arc<Mutex<Persisted>>,
     observations: Mutex<Observations>,
-    persistence: AsyncMutex<()>,
+    persistence: Arc<AsyncMutex<()>>,
     request_slot: Semaphore,
 }
 
@@ -122,6 +125,38 @@ fn eligible(account: &ProviderAccount) -> bool {
     account.enabled()
         && account.authentication_kind() == "oauth"
         && account.credential_state() == CredentialState::Ready
+}
+
+// Cookie 和调度配置会推进 revision；票只绑定真正用于上游认证的身份材料。
+fn auth_binding(
+    account: &ProviderAccount,
+    authentication: &CodexRuntimeAuthentication,
+) -> Option<String> {
+    let oauth = authentication.oauth()?;
+    let mut hash = Sha256::new();
+    for value in [
+        account.id().as_str(),
+        account.upstream_account_id().unwrap_or(""),
+        account.upstream_user_id().unwrap_or(""),
+        oauth.access_token.expose_secret(),
+        oauth
+            .refresh_token
+            .as_ref()
+            .map_or("", |v| v.expose_secret()),
+        oauth.id_token.as_ref().map_or("", |v| v.expose_secret()),
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    Some(hex::encode(hash.finalize()))
+}
+
+fn binding_matches(ticket: &Ticket, account: &ProviderAccount, binding: Option<&str>) -> bool {
+    match ticket.auth_binding.as_deref() {
+        Some(expected) => binding == Some(expected),
+        // 旧票没有身份摘要，仅在原 revision 完全一致时允许兼容使用。
+        None => ticket.credential_revision == account.revision().get(),
+    }
 }
 
 impl TicketService {
@@ -184,25 +219,34 @@ impl TicketService {
             profile,
             url: endpoint_url(base_url, CODEX_RESPONSES_PATH),
             path,
-            data: Mutex::new(data),
+            data: Arc::new(Mutex::new(data)),
             observations: Mutex::new(observations),
-            persistence: AsyncMutex::new(()),
+            persistence: Arc::new(AsyncMutex::new(())),
             request_slot: Semaphore::new(1),
         })
     }
 
     // 写成功后才发布内存状态；锁覆盖整个替换，防止旧快照覆盖新配置。
-    async fn commit(&self, next: Persisted) -> Result<(), ProviderAdminError> {
-        let bytes =
-            serde_json::to_vec(&next).map_err(|_| error(ProviderAdminErrorKind::Internal))?;
-        // 此小型本地状态文件同步原子替换，替换与内存发布之间不留取消点。
-        // 避免脱离请求生命周期的后台写盘在新策略之后覆盖旧文件。
-        atomic_write(&self.path, &bytes).map_err(|_| error(ProviderAdminErrorKind::Internal))?;
-        *self
-            .data
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-        Ok(())
+    async fn commit(
+        &self,
+        next: Persisted,
+        guard: OwnedMutexGuard<()>,
+    ) -> Result<(), ProviderAdminError> {
+        let path = self.path.clone();
+        let data = Arc::clone(&self.data);
+        // fsync 不占用异步执行线程；锁由写盘任务持有，即使请求取消也保证写盘与发布有序。
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let bytes =
+                serde_json::to_vec(&next).map_err(|_| error(ProviderAdminErrorKind::Internal))?;
+            atomic_write(&path, &bytes).map_err(|_| error(ProviderAdminErrorKind::Internal))?;
+            *data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+            Ok(())
+        })
+        .await
+        .map_err(|_| error(ProviderAdminErrorKind::Internal))?
     }
 
     pub(crate) async fn panel(&self) -> Result<TicketPanel, ProviderAdminError> {
@@ -211,6 +255,15 @@ impl TicketService {
             .list_for_provider()
             .await
             .map_err(|_| error(ProviderAdminErrorKind::Unavailable))?;
+        let mut bindings = BTreeMap::new();
+        for account in &accounts {
+            if eligible(account)
+                && let Ok(credential) = self.repository.load_runtime_credential(account).await
+                && let Some(binding) = auth_binding(account, &credential.authentication)
+            {
+                bindings.insert(account.id().as_str().to_owned(), binding);
+            }
+        }
         let d = self
             .data
             .lock()
@@ -239,7 +292,8 @@ impl TicketService {
                         .map(|model| {
                             let ticket = d.tickets.iter().find(|t| {
                                 t.account_id == id
-                                    && t.credential_revision == a.revision().get()
+                                    && eligible(a)
+                                    && binding_matches(t, a, bindings.get(id).map(String::as_str))
                                     && t.model == *model
                                     && t.expires_at > now()
                                     && valid_state(&t.state, target)
@@ -371,7 +425,7 @@ impl TicketService {
             return Err(error(ProviderAdminErrorKind::Invalid)
                 .with_public_message("账号列表已变化，请刷新页面后重新保存"));
         }
-        let guard = self.persistence.lock().await;
+        let guard = Arc::clone(&self.persistence).lock_owned().await;
         let mut next = self
             .data
             .lock()
@@ -384,6 +438,7 @@ impl TicketService {
             .revision
             .checked_add(1)
             .ok_or_else(|| error(ProviderAdminErrorKind::Conflict))?;
+        let old_settings = next.settings.clone();
         next.settings = update.settings;
         if let Some(entries) = update.proxies {
             if entries.len() > 64 {
@@ -435,14 +490,46 @@ impl TicketService {
             return Err(error(ProviderAdminErrorKind::Invalid)
                 .with_public_message("启用打标需要先配置代理池；清除代理池前请关闭打标"));
         }
-        // 策略改变后旧票全部失效，进行中的旧策略探测也不能重新写回。
-        next.tickets.clear();
-        self.commit(next).await?;
-        drop(guard);
+        // 间隔、代理名称及手动/自动切换不改变已获票的身份和有效期。
+        // 只淘汰被关闭、移除、目标长度不符或过期的票；缩短 TTL 只能收紧已有期限。
+        next.tickets.retain_mut(|ticket| {
+            let Some(account) = accounts
+                .iter()
+                .find(|a| a.id().as_str() == ticket.account_id)
+            else {
+                return false;
+            };
+            if next.settings.ttl_seconds < old_settings.ttl_seconds {
+                ticket.expires_at = ticket
+                    .expires_at
+                    .saturating_sub(old_settings.ttl_seconds - next.settings.ttl_seconds);
+            }
+            next.settings.enabled
+                && eligible(account)
+                && next
+                    .settings
+                    .accounts
+                    .get(&ticket.account_id)
+                    .is_some_and(|p| p.mode != TicketMode::Off)
+                && next.settings.models.contains(&ticket.model)
+                && ticket.expires_at > now()
+                && valid_state(
+                    &ticket.state,
+                    next.settings
+                        .target_length(&ticket.account_id, account.plan_type()),
+                )
+        });
+        self.commit(next, guard).await?;
         self.panel().await
     }
 
-    pub(crate) fn get(&self, account: &ProviderAccount, model: &str) -> Option<String> {
+    pub(crate) fn get(
+        &self,
+        account: &ProviderAccount,
+        authentication: &CodexRuntimeAuthentication,
+        model: &str,
+    ) -> Option<String> {
+        let binding = auth_binding(account, authentication);
         let d = self
             .data
             .lock()
@@ -464,7 +551,7 @@ impl TicketService {
             .iter()
             .find(|t| {
                 t.account_id == id
-                    && t.credential_revision == account.revision().get()
+                    && binding_matches(t, account, binding.as_deref())
                     && t.model == model
                     && t.expires_at > now()
                     && valid_state(&t.state, target)
@@ -560,22 +647,34 @@ impl TicketService {
         };
         let started_at = now();
         let started = Instant::now();
-        let outcome = self.send(&account, &input.model, &proxy).await;
+        let credential = self
+            .repository
+            .load_runtime_credential(&account)
+            .await
+            .map_err(|_| error(ProviderAdminErrorKind::Unavailable))?;
+        let binding = auth_binding(&account, &credential.authentication);
+        let outcome = self
+            .send(&account, &credential.authentication, &input.model, &proxy)
+            .await;
         let (status, state, retry, message) =
             outcome.unwrap_or_else(|message| (0, String::new(), 60, message.into()));
         let current = self.repository.store().get_account(&account_id).await;
-        let account_unchanged = current
-            .as_ref()
-            .ok()
-            .and_then(|a| a.as_ref())
-            .is_some_and(|a| {
-                eligible(a)
-                    && a.revision() == account.revision()
-                    && a.upstream_account_id() == account.upstream_account_id()
-                    && a.plan_type() == account.plan_type()
-            });
+        let account_unchanged = if let Some(a) = current.as_ref().ok().and_then(|a| a.as_ref()) {
+            if eligible(a) && a.plan_type() == account.plan_type() {
+                self.repository
+                    .load_runtime_credential(a)
+                    .await
+                    .is_ok_and(|c| {
+                        binding.is_some() && auth_binding(a, &c.authentication) == binding
+                    })
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let mut matched = status == 200 && valid_state(&state, target) && account_unchanged;
-        let guard = self.persistence.lock().await;
+        let guard = Arc::clone(&self.persistence).lock_owned().await;
         let mut next = self
             .data
             .lock()
@@ -607,6 +706,7 @@ impl TicketService {
             next.tickets.push(Ticket {
                 account_id: input.account_id.clone(),
                 credential_revision: account.revision().get(),
+                auth_binding: binding,
                 model: input.model.clone(),
                 state,
                 expires_at: now() + snapshot.settings.ttl_seconds,
@@ -639,8 +739,7 @@ impl TicketService {
             next.logs.drain(..next.logs.len() - LOG_LIMIT);
         }
         // 失败也落盘；不保存票原文、代理认证或上游正文。
-        let committed = self.commit(next).await;
-        drop(guard);
+        let committed = self.commit(next, guard).await;
         let mut o = self
             .observations
             .lock()
@@ -661,18 +760,11 @@ impl TicketService {
     async fn send(
         &self,
         account: &ProviderAccount,
+        authentication: &CodexRuntimeAuthentication,
         model: &str,
         proxy: &str,
     ) -> Result<(u16, String, u64, String), &'static str> {
-        let credential = self
-            .repository
-            .load_runtime_credential(account)
-            .await
-            .map_err(|_| "账号凭据读取失败")?;
-        let auth = credential
-            .authentication
-            .oauth()
-            .ok_or("账号没有 OAuth 凭据")?;
+        let auth = authentication.oauth().ok_or("账号没有 OAuth 凭据")?;
         let builder = reqwest::Client::builder()
             .no_proxy()
             .http1_only()

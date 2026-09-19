@@ -382,6 +382,192 @@ async fn ticket_injection_is_scoped_and_off_preserves_forwarding() {
 }
 
 #[tokio::test]
+async fn ticket_survives_mode_save_cookie_revision_and_reload_but_not_auth_rotation() {
+    let (config, store, server, bundle) = setup().await;
+    let admin = bundle.admin_provider();
+    let mut panel = admin.ticket_panel().await.unwrap();
+    panel.settings.enabled = true;
+    panel.settings.inject = true;
+    panel.settings.models = vec!["gpt-5.4".into()];
+    panel.settings.accounts.insert(
+        "acct_ticket_a".into(),
+        TicketAccountPolicy {
+            mode: TicketMode::Auto,
+            target_length: Some(292),
+        },
+    );
+    admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings: panel.settings,
+            proxy_url: Some(server.uri()),
+            proxy_pool: None,
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    let ticket = format!("gAAAAA{}", "c".repeat(286));
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("x-codex-turn-state", ticket.as_str()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(
+        admin
+            .probe_ticket(TicketProbe {
+                account_id: "acct_ticket_a".into(),
+                model: "gpt-5.4".into()
+            })
+            .await
+            .unwrap()
+            .matched
+    );
+    let panel = admin.ticket_panel().await.unwrap();
+    let expires = panel
+        .accounts
+        .iter()
+        .find(|a| a.id == "acct_ticket_a")
+        .unwrap()
+        .models[0]
+        .expires_at;
+    let mut settings = panel.settings;
+    settings.accounts.get_mut("acct_ticket_a").unwrap().mode = TicketMode::Manual;
+    settings.interval_seconds = 30;
+    let saved = admin
+        .update_tickets(TicketUpdate {
+            revision: panel.revision,
+            settings,
+            proxy_url: None,
+            proxy_pool: None,
+            proxies: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        saved
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .expires_at,
+        expires
+    );
+    let id = ProviderAccountId::new("acct_ticket_a").unwrap();
+    let account = store.get_account(&id).await.unwrap().unwrap();
+    let mut data = store
+        .repository()
+        .load_complete_data(&account)
+        .await
+        .unwrap();
+    data.cookies_mut()
+        .unwrap()
+        .push(provider_openai::credential::CodexCookie {
+            name: "__cf_bm".into(),
+            value: "synthetic-cookie".into(),
+            domain: "chatgpt.com".into(),
+            path: "/".into(),
+            host_only: true,
+            secure: true,
+            expires_at: None,
+        });
+    store
+        .repository()
+        .compare_and_swap_data(&account, data)
+        .await
+        .unwrap();
+    let restored = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store.clone(), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    assert!(
+        restored
+            .admin_provider()
+            .ticket_panel()
+            .await
+            .unwrap()
+            .accounts
+            .iter()
+            .find(|a| a.id == "acct_ticket_a")
+            .unwrap()
+            .models[0]
+            .ready
+    );
+    server.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(COMPLETED_SESSION_SSE),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    for index in 0..2 {
+        if index == 1 {
+            let account = store.get_account(&id).await.unwrap().unwrap();
+            let mut data = store
+                .repository()
+                .load_complete_data(&account)
+                .await
+                .unwrap();
+            data.oauth_mut().unwrap().access_token = "rotated-test-only".into();
+            store
+                .repository()
+                .compare_and_swap_data(&account, data)
+                .await
+                .unwrap();
+            assert!(
+                !restored
+                    .admin_provider()
+                    .ticket_panel()
+                    .await
+                    .unwrap()
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == "acct_ticket_a")
+                    .unwrap()
+                    .models[0]
+                    .ready
+            );
+        }
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.4","input":"hello"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".into(), json!(false))]));
+        let mut stream = restored
+            .core_provider()
+            .execute(
+                initialized_provider_request(
+                    Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                    "acct_ticket_a",
+                ),
+                initialized_attempt_context(&format!("req_ticket_reuse_{index}"), "acct_ticket_a"),
+            )
+            .await
+            .unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].headers.get("x-codex-turn-state").unwrap(),
+        ticket.as_str()
+    );
+    assert!(!requests[1].headers.contains_key("x-codex-turn-state"));
+}
+
+#[tokio::test]
 async fn ticket_worker_only_probes_auto_accounts_and_rejects_wrong_length() {
     let (_config, _store, server, mut bundle) = setup().await;
     let admin = bundle.admin_provider();

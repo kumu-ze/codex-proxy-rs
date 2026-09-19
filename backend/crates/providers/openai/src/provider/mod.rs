@@ -558,11 +558,13 @@ impl Provider for CodexProvider {
             account_scope,
         );
         // 先清理客户端跨账号状态，再注入当前账号/模型的管理票，防止被身份清理抹掉。
-        if let Some(state) = self
-            .tickets
-            .as_ref()
-            .and_then(|s| s.get(lease.account(), upstream_model.as_str()))
-        {
+        if let Some(state) = self.tickets.as_ref().and_then(|s| {
+            s.get(
+                lease.account(),
+                lease.authentication(),
+                upstream_model.as_str(),
+            )
+        }) {
             upstream_request.turn_state = Some(state);
         }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
