@@ -12,7 +12,7 @@
 | 架构 | `cargo test --offline --locked --manifest-path backend/Cargo.toml -p codex-proxy-rs -p gateway-api --test main architecture -- --test-threads=1` | 组合根 12 项、API 5 项通过 |
 | Rust 格式 | `cargo fmt --all --manifest-path backend/Cargo.toml` | 已应用，变更文件经过格式化 |
 | 前端 | 在 frontend 下运行 `node node_modules/eslint/bin/eslint.js .`、`node node_modules/vue-tsc/bin/vue-tsc.js -b --pretty false`、`node node_modules/vite/bin/vite.js build` | ESLint、类型检查与构建通过；最后手机布局修改后重跑相应文件 ESLint、类型和构建 |
-| 打标独立进程 | 私有插件仓库 `python3 tests/workflow.py dist/turn-state-0.2.1/worker` | 保存、手动探测、身份门禁、代理导入、出口采样、日志、持续并发、按需自动、重启恢复通过；Provider 为模拟服务，不访问真实上游 |
+| 打标独立进程 | 独立插件仓库 `python3 tests/workflow.py dist/turn-state-0.2.1/worker` | 保存、手动探测、身份门禁、代理导入、出口采样、日志、持续并发、按需自动、重启恢复通过；Provider 为模拟服务，不访问真实上游 |
 | 部署 | 独立 Docker 验证实例、克隆数据库、保留历史迁移原字节的兼容构建 | healthz 204；版本 3.12.1-plugin.2；turn-state 0.2.1 可用；原生产实例未切换 |
 | 浏览器 | Playwright CLI，实际部署的 HTTP 页面，1440×1000、390×844 | 从侧栏直接打开打标、停用隐藏菜单、容器重启后仍停用、重新启用恢复入口；URL 安装示例包默认停用，启用后打开页面，停用卸载，错误 SHA256 提示均通过 |
 

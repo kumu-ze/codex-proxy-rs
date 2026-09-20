@@ -4,7 +4,7 @@
 
 宿主版本 **3.12.1-plugin.2**，基于上游 **v3.12.1 / 01006380**。代码位于 kumu-ze/codex-proxy-rs 的 codex/plugin-host 分支；本方案用于提供上游设计参考，不代表上游已经接受插件 API。API 主版本目前为 1，仍可能在后续实验版发生不兼容变化。构建默认读取 release/version.yaml，不要把 CPR_VERSION 改成无后缀的官方版本。
 
-独立示例为 examples/plugins/echo；完整 Turn-State 插件位于另一个私有仓库 kumu-ze/rs-turn-state-plugin。上游评审不需要私有仓库即可运行 echo 和宿主测试，但无法仅凭公开宿主仓库复现全部打标业务。宿主不引用该业务 crate，也不内置其策略、调度、页面或数据模型。
+独立示例为 examples/plugins/echo；完整 Turn-State 插件位于独立的公开仓库 [kumu-ze/rs-turn-state-plugin](https://github.com/kumu-ze/rs-turn-state-plugin)，可从其 Release 获取插件包；上游评审可分别运行 echo、宿主测试和独立业务工作流。宿主不引用该业务 crate，也不内置其策略、调度、页面或数据模型。
 
 ## 架构与调用关系
 
