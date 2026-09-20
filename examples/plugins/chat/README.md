@@ -1,16 +1,16 @@
-# 对话测试插件 0.2.1
+# 对话测试插件 0.2.2
 
 最低宿主 fork **3.12.1-plugin.4**，推荐 **3.12.1-plugin.5**。API 1 manifest 声明 `ui.chat`，宿主负责地址、Key 选择与正常 Responses 请求；原生程序只提供隔离页面。
 
 ## 下载
 
-[安装包与校验值](https://github.com/kumu-ze/codex-proxy-rs/releases/tag/chat-test-v0.2.1)
+[安装包与校验值](https://github.com/kumu-ze/codex-proxy-rs/releases/tag/chat-test-v0.2.2)
 
-URL 安装地址：`https://github.com/kumu-ze/codex-proxy-rs/releases/download/chat-test-v0.2.1/rs-chat-test-0.2.1-linux-x64.tar.gz`
+URL 安装地址：`https://github.com/kumu-ze/codex-proxy-rs/releases/download/chat-test-v0.2.2/rs-chat-test-0.2.2-linux-x64.tar.gz`
 
 ## 使用
 
-启用插件后从侧栏打开“对话测试”。页面自动识别当前站点地址，并读取已启用的 Client API Key 名称与前缀：只有一个时自动选中，多个时下拉选择。点击加载模型，或手动填写模型名后发送。无需复制 Key 或配置内部端口；至少需要选定 Key 所属范围内有可用账号。
+启用插件后从侧栏打开“对话测试”。页面自动识别当前站点地址，并读取已启用的 Client API Key 名称与前缀：只有一个时自动选中，多个时下拉选择。点击加载模型后，从完整下拉列表选择；选中一个模型不会过滤其他选项。也可选“手动输入模型名…”后填写自定义名称。重新加载会保留仍在列表中的选择。无需复制 Key 或配置内部端口；至少需要选定 Key 所属范围内有可用账号。
 
 页面的“API 地址”显示当前站点加 `/v1`；实际请求始终使用 `/v1/models` 和 `/v1/responses`，不会重复拼接 `/v1`。
 
@@ -28,10 +28,10 @@ Key 明文由宿主管理页按选定 ID 获取，仅用于该次 fetch 的 Auth
 
 ```sh
 cargo build --release --locked
-python3 scripts/package.py target/release/rs-plugin-chat-test dist/chat-test-0.2.1
-python3 tests/workflow.py dist/chat-test-0.2.1/worker
+python3 scripts/package.py target/release/rs-plugin-chat-test dist/chat-test-0.2.2
+python3 tests/workflow.py dist/chat-test-0.2.2/worker
 ```
 
 附件仅含 worker 和 plugin.json，源码只依赖 serde_json。进程测试覆盖握手、页面以及拒绝旧的密钥 RPC；同源请求、Key 选择、SSE、取消和权限隔离由宿主浏览器验收覆盖，结果见宿主 docs/plugins-validation.md。
 
-0.1.0 的手动 Key/内部端口模式已被替换；0.2.1 不能用于尚不识别 ui.chat 的旧宿主。
+0.1.0 的手动 Key/内部端口模式已被替换；0.2.2 不能用于尚不识别 ui.chat 的旧宿主。

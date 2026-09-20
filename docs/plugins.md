@@ -169,7 +169,7 @@ credentialScope 为 Provider 对账号及真实认证材料的不可逆摘要；
 
 ## 对话测试插件
 
-`examples/plugins/chat` 版本 0.2.1，最低宿主 3.12.1-plugin.4，推荐使用显示完整 API 地址的 3.12.1-plugin.5，声明 `ui.chat` 能力。原生进程只实现 initialize/admin.ui，页面不再输入密钥或内网端口。宿主从当前浏览器 origin（开发环境附加 /dev 前缀）确定 `/v1/models`、`/v1/responses` 地址，读取已启用 Key 的 ID/名称/前缀；唯一 Key 默认选中，多个 Key 由用户选择。
+`examples/plugins/chat` 版本 0.2.2，最低宿主 3.12.1-plugin.4，推荐使用显示完整 API 地址的 3.12.1-plugin.5，声明 `ui.chat` 能力。原生进程只实现 initialize/admin.ui，页面不再输入密钥或内网端口。宿主从当前浏览器 origin（开发环境附加 /dev 前缀）确定 `/v1/models`、`/v1/responses` 地址，读取已启用 Key 的 ID/名称/前缀；唯一 Key 默认选中，多个 Key 由用户选择。
 
 页面通过 `rs-plugin-host-call` 消息调用 chat.context/start/poll/cancel，回复为 rs-plugin-host-result。宿主校验消息来源窗口与当前插件绑定；context 和每个请求任务都回读插件是否仍启用、可用且具有 ui.chat 权限。Key 必须在当前已启用列表中，宿主按 ID 获取明文后仅用于同源 fetch，拒绝重定向。密钥不发送到 iframe 或原生插件；也不持久化。普通 admin.* 进程桥继续独立运行，插件不能自行选择任意宿主接口。
 
