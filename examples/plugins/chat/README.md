@@ -1,31 +1,35 @@
-# 对话测试插件 0.1.0
+# 对话测试插件 0.2.0
 
-独立 Rust 原生插件，用 RS 标准 `/v1/models` 和 `/v1/responses` 验证真实请求链路，不直接调用 Provider、不需要 OAuth。适配 fork 插件 API 1。
+需要宿主 fork **3.12.1-plugin.4**。API 1 manifest 声明 `ui.chat`，宿主负责地址、Key 选择与正常 Responses 请求；原生程序只提供隔离页面。
 
 ## 下载
 
-[安装包与 SHA256](https://github.com/kumu-ze/codex-proxy-rs/releases/tag/chat-test-v0.1.0)
+[安装包与校验值](https://github.com/kumu-ze/codex-proxy-rs/releases/tag/chat-test-v0.2.0)
 
-URL 安装地址：`https://github.com/kumu-ze/codex-proxy-rs/releases/download/chat-test-v0.1.0/rs-chat-test-0.1.0-linux-x64.tar.gz`
+URL 安装地址：`https://github.com/kumu-ze/codex-proxy-rs/releases/download/chat-test-v0.2.0/rs-chat-test-0.2.0-linux-x64.tar.gz`
 
 ## 使用
 
-在“插件”页面安装并启用包，左侧打开“对话测试”。填入 **RS API 密钥页生成的 Client Key**，加载模型或手动输入模型名，输入消息并发送。需要 Key 所属分组中有可用账号。请求会消耗正常模型用量；可观察 RS 使用统计与打标插件行为。
+启用插件后从侧栏打开“对话测试”。页面自动识别当前站点地址，并读取已启用的 Client API Key 名称与前缀：只有一个时自动选中，多个时下拉选择。点击加载模型，或手动填写模型名后发送。无需复制 Key 或配置内部端口；至少需要选定 Key 所属范围内有可用账号。
 
-默认连接同容器本机端口 8080，特殊部署可展开连接设置调整端口。只支持本机 HTTP，不允许任意地址转发。API Key 仅用于当前页面，不写磁盘；插件作业内存十分钟后在下一次 RPC 时清理。离开页面/点击停止会尽力取消，但不能撤销上游已处理的请求。
+请求使用浏览器当前同源 `/v1/models`、`/v1/responses`；开发预览沿用宿主 `/dev` 代理前缀。保留正常鉴权、路由、计量和请求扩展行为。真实调用会消耗模型用量。
 
-支持：多轮文本、模型列表、SSE 分片显示、取消、HTTP 错误、请求 ID、耗时、用量。暂不支持工具调用/附件/Markdown/WS。页面回复按纯文本显示，不能执行模型返回的 HTML。
+Key 明文由宿主管理页按选定 ID 获取，仅用于该次 fetch 的 Authorization，不进入 iframe、原生插件 RPC、磁盘或 localStorage。对话仅留页面内存；关闭页面会取消未完成的本页请求。宿主正常计量与请求诊断日志仍按配置记录。手动停止不能撤回上游已执行用量。
 
-## 构建
+## 权限
+
+`ui.chat` 允许可信插件页面列出已启用 Key 的 ID/名称/前缀，并使用选定 ID 发起同源模型/对话请求；它不返回 Key 明文。宿主每次开始任务前检查插件仍启用且声明此权限，拒绝外部 URL、自定义请求头与重定向。未声明此权限的插件不能使用该页面桥。此授权仍有模型用量影响，只安装可信代码。
+
+支持多轮文本、SSE 逐步回复、停止、HTTP 状态/请求 ID/耗时/用量。暂不支持工具、附件、Markdown 或 WebSocket。回复按纯文本渲染。
+
+## 构建和验证
 
 ```sh
 cargo build --release --locked
-python3 scripts/package.py target/release/rs-plugin-chat-test dist/chat-test-0.1.0
-python3 tests/workflow.py dist/chat-test-0.1.0/worker
+python3 scripts/package.py target/release/rs-plugin-chat-test dist/chat-test-0.2.0
+python3 tests/workflow.py dist/chat-test-0.2.0/worker
 ```
 
-产物为 `dist/rs-chat-test-0.1.0-linux-x64.tar.gz`，根目录包含 worker、plugin.json。不得打包密钥、对话或运行数据。Cargo.lock 和与宿主一致的 hyper-util 修复提交均已锁定。
+附件仅含 worker 和 plugin.json，源码只依赖 serde_json。进程测试覆盖握手、页面以及拒绝旧的密钥 RPC；同源请求、Key 选择、SSE、取消和权限隔离由宿主浏览器验收覆盖，结果见宿主 docs/plugins-validation.md。
 
-## 验证范围
-
-workflow.py 启动真实插件进程和本机模拟 HTTP/SSE 服务，覆盖握手、页面、模型、逐字节中文 UTF-8 分片、多轮正文、用量、错误脱敏、取消及无文件持久化。它不调用真实付费模型。源码不引用宿主内部 crate，manifest 不申请 provider.openai 或 request.openai 能力。
+0.1.0 的手动 Key/内部端口模式已被替换；0.2.0 不能用于尚不识别 ui.chat 的旧宿主。

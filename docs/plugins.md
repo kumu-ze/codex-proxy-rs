@@ -2,7 +2,7 @@
 
 ## 版本与定位
 
-宿主版本 **3.12.1-plugin.3**，基于上游 **v3.12.1 / 01006380**。代码位于 kumu-ze/codex-proxy-rs 的 codex/plugin-host 分支；本方案用于提供上游设计参考，不代表上游已经接受插件 API。API 主版本目前为 1，仍可能在后续实验版发生不兼容变化。构建默认读取 release/version.yaml，不要把 CPR_VERSION 改成无后缀的官方版本。
+宿主版本 **3.12.1-plugin.4**，基于上游 **v3.12.1 / 01006380**。代码位于 kumu-ze/codex-proxy-rs 的 codex/plugin-host 分支；本方案用于提供上游设计参考，不代表上游已经接受插件 API。API 主版本目前为 1，仍可能在后续实验版发生不兼容变化。构建默认读取 release/version.yaml，不要把 CPR_VERSION 改成无后缀的官方版本。
 
 独立示例为 examples/plugins/echo，另有 [对话测试插件](../examples/plugins/chat/README.md)；完整 Turn-State 插件位于独立的公开仓库 [kumu-ze/rs-turn-state-plugin](https://github.com/kumu-ze/rs-turn-state-plugin)，可从其 Release 获取插件包；上游评审可分别运行 echo、宿主测试和独立业务工作流。宿主不引用该业务 crate，也不内置其策略、调度、页面或数据模型。
 
@@ -50,7 +50,7 @@ flowchart LR
 }
 ```
 
-id 为 1–64 个小写字母、数字或连字符；version 使用 SemVer。menuLabel 可省略，非空时最多 24 个字符且不能包含控制字符；宿主将它作为纯文本渲染。可选能力当前仅接受上例两种。清单最多 64 KiB、256 个文件，文件合计最多 128 MiB，必须包含 executable。拒绝路径穿越、绝对路径、符号链接和摘要不匹配。
+id 为 1–64 个小写字母、数字或连字符；version 使用 SemVer。menuLabel 可省略，非空时最多 24 个字符且不能包含控制字符；宿主将它作为纯文本渲染。可选能力支持 request.openai、provider.openai 和 ui.chat。ui.chat 是宿主管理页面的对话桥授权，允许使用已有 Client Key 发起正常请求，不向插件返回密钥明文。清单最多 64 KiB、256 个文件，文件合计最多 128 MiB，必须包含 executable。拒绝路径穿越、绝对路径、符号链接和摘要不匹配。
 
 1. 实现下节中的 initialize 握手；stdout 只传协议帧，不能混入日志。
 2. 可选实现 admin.ui、admin.* 管理方法；后台长任务由插件管理并使用短调用轮询结果。
@@ -103,7 +103,7 @@ stdin/stdout 为 4 字节大端长度 + UTF-8 JSON，每帧最大 1 MiB。宿主
 
 | 接口 | 输入 / 输出 |
 | --- | --- |
-| GET /api/admin/plugins | 列表：id、version、enabled、available、menuLabel |
+| GET /api/admin/plugins | 列表：id、version、enabled、available、menuLabel、capabilities |
 | POST /api/admin/plugins/invoke | `{ "id":"example", "method":"admin.ui", "input":{} }`，返回插件结果 |
 | POST /api/admin/plugins/manage | `{ "action":"install", "url":"https://.../package.tar.gz", "sha256":"可选整包摘要", "proxyId":"可选的宿主代理ID" }` |
 | POST /api/admin/plugins/manage | `{ "action":"enable或disable或uninstall", "id":"example" }`；实际 action 分别为 enable、disable、uninstall |
@@ -166,6 +166,10 @@ credentialScope 为 Provider 对账号及真实认证材料的不可逆摘要；
 
 ## 对话测试插件
 
-`examples/plugins/chat` 是无需宿主业务能力授权的独立原生插件，版本 0.1.0。管理员在隔离页面输入 **RS Client API Key**，插件仅回连 `127.0.0.1:<端口>` 的 `/v1/models` 和 `/v1/responses`，端口默认 8080。它不会直接调用 Provider 探测接口，也不会取得 OAuth；正常 Key 鉴权、账号分组、路由、计量与 request.openai 扩展都会执行。
+`examples/plugins/chat` 版本 0.2.0，要求宿主 3.12.1-plugin.4，声明 `ui.chat` 能力。原生进程只实现 initialize/admin.ui，页面不再输入密钥或内网端口。宿主从当前浏览器 origin（开发环境附加 /dev 前缀）确定 `/v1/models`、`/v1/responses` 地址，读取已启用 Key 的 ID/名称/前缀；唯一 Key 默认选中，多个 Key 由用户选择。
 
-页面支持模型列表/手动输入、多轮消息、SSE 回复轮询、停止与清空对话，显示 HTTP 状态、请求 ID、耗时和用量。客户端密钥与消息只留在页面和插件进程内存，不写插件文件；宿主正常请求日志/计量与管理员诊断配置仍适用。停止尽力取消 HTTP，不能撤回上游已执行的用量。尚未支持工具调用、附件、Markdown 富文本或 WebSocket。
+页面通过 `rs-plugin-host-call` 消息调用 chat.context/start/poll/cancel，回复为 rs-plugin-host-result。宿主校验消息来源窗口与当前插件绑定；context 和每个请求任务都回读插件是否仍启用、可用且具有 ui.chat 权限。Key 必须在当前已启用列表中，宿主按 ID 获取明文后仅用于同源 fetch，拒绝重定向。密钥不发送到 iframe 或原生插件；也不持久化。普通 admin.* 进程桥继续独立运行，插件不能自行选择任意宿主接口。
+
+ui.chat 是独立且有用量影响的权限，允许可信插件页面使用已有 Key 发起请求，不能把“未返回明文”当作没有费用风险。当前尚无逐 Key 的安装授权界面；同一管理会话有权限查看的启用 Key 都可选择。浏览器中的管理员仍可通过自己的开发工具查看请求，iframe 隔离不限制管理员本人。
+
+同一页面仅一个在途任务、最多保留 8 个任务结果；消息最多 40 条/64K 字符，响应流最多 2 MiB、120 秒。关闭页面取消本页任务，停止不能撤回上游已执行用量。正常 Key 鉴权、账号分组、路由、计量和 request.openai 扩展仍生效；只留在页面内存的聊天记录也可能按宿主正常诊断配置记入请求日志。

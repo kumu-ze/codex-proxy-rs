@@ -52,3 +52,22 @@ fn rejects_symlinked_executables() {
         Err(PluginError::InvalidPackage)
     ));
 }
+#[test]
+fn chat_ui_capability_is_explicit_and_unknown_capabilities_are_rejected() {
+    for (capabilities, allowed) in [
+        (serde_json::json!(["ui.chat"]), true),
+        (
+            serde_json::json!(["request.openai", "provider.openai", "ui.chat"]),
+            true,
+        ),
+        (serde_json::json!(["ui.admin"]), false),
+    ] {
+        let dir = super::package(b"example");
+        let path = dir.path().join("plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["capabilities"] = capabilities;
+        std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(PluginPackage::open(dir.path()).is_ok(), allowed);
+    }
+}

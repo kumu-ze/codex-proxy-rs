@@ -62,8 +62,8 @@ impl PluginPackage {
             || manifest
                 .capabilities
                 .iter()
-                .any(|c| c != "request.openai" && c != "provider.openai")
-            || manifest.capabilities.len() > 2
+                .any(|c| c != "request.openai" && c != "provider.openai" && c != "ui.chat")
+            || manifest.capabilities.len() > 3
             || manifest.menu_label.as_ref().is_some_and(|label| {
                 label.trim().is_empty()
                     || label.chars().count() > 24

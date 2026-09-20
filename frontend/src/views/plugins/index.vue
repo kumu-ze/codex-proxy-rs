@@ -2,7 +2,7 @@
 import type { PluginManagement, PluginStatus } from '@/api/modules/plugins'
 import { useEventListener } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { invokePlugin, managePlugin } from '@/api/modules/plugins'
 import { getProxies } from '@/api/modules/proxies'
@@ -16,6 +16,7 @@ import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseTag from '@/components/base/BaseTag.vue'
 import { usePluginsStore } from '@/stores/modules/plugins'
+import { createGatewayChatBridge } from './gatewayChat'
 
 const store = usePluginsStore()
 const { plugins } = storeToRefs(store)
@@ -89,6 +90,8 @@ const document = ref('')
 const frame = ref<HTMLIFrameElement>()
 let generation = 0
 let pending = false
+let gatewayChat: ReturnType<typeof createGatewayChatBridge> | undefined
+onBeforeUnmount(() => gatewayChat?.dispose())
 
 async function load() {
   loading.value = true
@@ -106,6 +109,8 @@ async function load() {
 
 async function open(plugin: PluginStatus) {
   const current = ++generation
+  gatewayChat?.dispose()
+  gatewayChat = plugin.capabilities?.includes('ui.chat') ? createGatewayChatBridge(plugin.id) : undefined
   selected.value = plugin.id
   document.value = ''
   failure.value = ''
@@ -129,6 +134,23 @@ useEventListener(window, 'message', async (event: MessageEvent) => {
   if (!target || event.source !== target || !selected.value)
     return
   const message = event.data
+  if (message?.type === 'rs-plugin-host-call' && typeof message.id === 'string' && message.id.length <= 64
+    && ['chat.context', 'chat.start', 'chat.poll', 'chat.cancel'].includes(message.method)) {
+    const current = generation
+    const bridge = gatewayChat
+    try {
+      if (!bridge)
+        throw new Error('插件没有对话页面权限')
+      const data = await bridge.invoke(message.method, message.input ?? {})
+      if (current === generation && target === frame.value?.contentWindow)
+        target.postMessage({ type: 'rs-plugin-host-result', id: message.id, data }, '*')
+    }
+    catch (error) {
+      if (current === generation && target === frame.value?.contentWindow)
+        target.postMessage({ type: 'rs-plugin-host-result', id: message.id, error: error instanceof Error ? error.message : '操作失败' }, '*')
+    }
+    return
+  }
   if (message?.type === 'rs-plugin-resize' && typeof message.height === 'number' && Number.isFinite(message.height)) {
     frameHeight.value = Math.max(600, Math.min(30000, message.height))
     return
@@ -157,6 +179,8 @@ useEventListener(window, 'message', async (event: MessageEvent) => {
 
 watch(pageId, async (id) => {
   ++generation
+  gatewayChat?.dispose()
+  gatewayChat = undefined
   document.value = ''
   selected.value = ''
   frameHeight.value = 720

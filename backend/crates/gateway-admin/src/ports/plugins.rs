@@ -12,6 +12,7 @@ pub struct PluginStatus {
     pub available: bool,
     pub enabled: bool,
     pub menu_label: Option<String>,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Deserialize)]

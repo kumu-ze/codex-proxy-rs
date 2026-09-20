@@ -1,6 +1,6 @@
 [package]
 name = "rs-plugin-chat-test"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -8,12 +8,4 @@ publish = false
 [workspace]
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
-reqwest = { version = "=0.12.28", default-features = false, features = ["json", "stream"] }
-futures = "0.3.32"
-uuid = { version = "1.26.1", features = ["v4"] }
-[patch.crates-io]
-# 与宿主使用相同的已锁定传输修复版本。
-hyper-util = { git = "https://github.com/hyperium/hyper-util", rev = "191b1acf0a6b18e807e4abf5a6d4a7c47979ecd6" }

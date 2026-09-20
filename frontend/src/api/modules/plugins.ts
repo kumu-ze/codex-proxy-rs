@@ -6,6 +6,7 @@ export interface PluginStatus {
   available: boolean
   enabled: boolean
   menuLabel: string | null
+  capabilities: string[]
 }
 
 export function getPlugins() {
