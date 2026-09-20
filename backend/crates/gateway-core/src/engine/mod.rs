@@ -5,6 +5,7 @@ pub mod budget;
 pub mod continuation;
 pub mod coordinator;
 pub mod execution;
+pub mod extensions;
 mod observation;
 pub mod probe;
 pub mod provider;

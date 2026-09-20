@@ -19,6 +19,8 @@ pub struct GatewayConfig {
     api: gateway_api::ApiConfig,
     #[serde(default)]
     openai: provider_openai::OpenAiConfig,
+    #[serde(default)]
+    plugins: Vec<gateway_host::plugins::PluginConfig>,
 }
 
 impl LoadableConfig for GatewayConfig {
@@ -34,6 +36,11 @@ impl LoadableConfig for GatewayConfig {
         self.host
             .resolve_and_validate(source_dir, &self.api.asset_directory)?;
         let runtime_data_dir = self.host.runtime_data_dir().to_path_buf();
+        for plugin in &mut self.plugins {
+            plugin
+                .resolve(source_dir)
+                .map_err(|_| ConfigError::InvalidField("plugins"))?;
+        }
         self.store
             .resolve_and_validate(&runtime_data_dir)
             .map_err(|_| ConfigError::InvalidField("store"))?;
@@ -61,15 +68,25 @@ pub async fn run() -> Result<(), BootstrapError> {
         client,
         api,
         openai,
+        plugins,
     } = config;
 
+    let plugin_directory = host.runtime_data_dir().join("plugins");
     let host = gateway_host::initialize(host).await?;
     host.report_startup_ready("Host");
+    let plugins =
+        gateway_host::plugins::PluginRegistry::start_managed(plugins, &plugin_directory).await?;
     let mut store = gateway_store::initialize(store).await?;
     host.report_startup_ready("Store");
     let provider_ports = store.provider_ports();
-    let mut openai = provider_openai::initialize(openai, provider_ports.clone()).await?;
+    let mut openai = provider_openai::initialize_with_extension(
+        openai,
+        provider_ports.clone(),
+        Some(plugins.clone()),
+    )
+    .await?;
     host.report_startup_ready("OpenAI Provider");
+    plugins.attach_provider_services(openai.extension_services(), store.admin_ports().proxies())?;
     let mut xai = provider_xai::initialize(provider_ports).await?;
     host.report_startup_ready("xAI Provider");
     let providers = ProviderRegistry::new([openai.core_provider(), xai.core_provider()])?;
@@ -99,7 +116,7 @@ pub async fn run() -> Result<(), BootstrapError> {
     let api = gateway_api::initialize(
         api,
         core.execution_service(),
-        admin.services(),
+        admin.services().with_plugins(plugins.clone()),
         probes,
         host.worker_health(),
         host.connection_lifecycle(),
@@ -113,13 +130,17 @@ pub async fn run() -> Result<(), BootstrapError> {
     plan.extend(admin.take_worker_contributions());
     host.start_workers(plan, store.worker_leader_lease())?;
     host.report_startup_ready("Workers");
-    host.serve(api.router()).await?;
+    let served = host.serve(api.router()).await;
+    plugins.shutdown().await;
+    served?;
     Ok(())
 }
 
 /// 组合根只保留包级错误分类，不展开内部实现或敏感配置。
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
+    #[error(transparent)]
+    Plugins(#[from] gateway_host::plugins::PluginError),
     #[error(transparent)]
     Config(#[from] gateway_host::ConfigError),
     #[error(transparent)]

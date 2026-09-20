@@ -6,6 +6,62 @@ use provider_openai::credential::{
 use secrecy::SecretString;
 
 #[test]
+fn extension_scope_tracks_identity_but_not_profile_or_revision() {
+    use gateway_core::account::{CredentialRevision, ProviderAccount, ProviderAccountId};
+    use gateway_core::routing::ProviderKind;
+    use provider_openai::credential::CodexRuntimeAuthentication;
+    let account = |id: &str, user: &str, upstream: &str, revision| {
+        ProviderAccount::new(
+            ProviderAccountId::new(id).unwrap(),
+            ProviderKind::new("openai").unwrap(),
+            "name".into(),
+            Some(user.into()),
+            "oauth".into(),
+            CredentialRevision::new(revision).unwrap(),
+            None,
+        )
+        .with_profile(None, Some(upstream.into()), Some("plus".into()))
+    };
+    let auth = |at: &str, rt: &str, it: &str| {
+        CodexRuntimeAuthentication::OAuth(CodexOAuthSecret {
+            access_token: SecretString::from(at.to_owned()),
+            refresh_token: Some(SecretString::from(rt.to_owned())),
+            id_token: Some(SecretString::from(it.to_owned())),
+        })
+    };
+    let original = account("acct_one", "user", "upstream", 1);
+    let scope = auth("access", "refresh", "identity").extension_scope(&original);
+    assert_eq!(scope.len(), 64);
+    assert_eq!(
+        scope,
+        auth("access", "refresh", "identity").extension_scope(
+            &account("acct_one", "user", "upstream", 2).with_profile(
+                Some("new@example.test".into()),
+                Some("upstream".into()),
+                Some("pro".into())
+            )
+        )
+    );
+    for changed in [
+        account("acct_two", "user", "upstream", 1),
+        account("acct_one", "other", "upstream", 1),
+        account("acct_one", "user", "other", 1),
+    ] {
+        assert_ne!(
+            scope,
+            auth("access", "refresh", "identity").extension_scope(&changed)
+        );
+    }
+    for changed in [
+        auth("new", "refresh", "identity"),
+        auth("access", "new", "identity"),
+        auth("access", "refresh", "new"),
+    ] {
+        assert_ne!(scope, changed.extension_scope(&original));
+    }
+}
+
+#[test]
 fn oauth_secret_debug_redacts_every_token() {
     let secret = CodexOAuthSecret {
         access_token: SecretString::from("access-private"),

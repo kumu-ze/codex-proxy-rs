@@ -145,6 +145,14 @@ WS 路由提示属于握手，连接复用时不重发；档位变化不重建�
 Provider 本地估算按当前 attempt 实际发送的上游模型查价，响应声明的模型只作观测；费用明细复用同一口径。
 Client Key 费用账本独立累计各次 attempt 的实际费用，不能因请求重试而清空已产生的费用或未知计费状态。
 
+### 外部插件边界
+
+可选原生插件由 Host 负责安装、校验、进程监督及独立数据目录；Admin 暴露 PluginOperations 端口，API 只提供固定管理员路由。插件不能注册宿主路由或跨越 workspace 依赖方向。
+
+Core 的 RequestExtension/ExtensionServices 是可选端口；具体 Provider 在实际账号确定后提供受限上下文并解释允许修改的字段。启用扩展失效时拒绝本次处理；明确停用则不调用扩展。Provider 保留 OAuth 所有权。
+
+插件页面使用不透明来源 iframe 与窗口来源绑定的消息桥。ui.chat 由宿主管理前端执行同源正常数据面请求，密钥明文不交给插件。原生程序仍与宿主共享 OS 用户权限，隔离范围与已知限制见 [插件指南](plugins.md)，接口字段见 [插件 API](plugin-api.md)。
+
 ## 4. 数据面请求生命周期
 
 ```mermaid

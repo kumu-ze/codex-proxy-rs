@@ -1,0 +1,8 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<style>body{font-family:system-ui,sans-serif;padding:24px;color:#172b4d}button{padding:12px 20px;border:0;border-radius:8px;background:#4169c9;color:white}pre{white-space:pre-wrap}</style>
+<h1>插件示例</h1><p>通过隔离页面调用独立插件进程。</p><button id="send">测试通信</button><pre id="result"></pre>
+<script>
+const button = document.getElementById('send');
+button.onclick = () => { button.disabled = true; parent.postMessage({type:'rs-plugin-call',id:'echo',method:'admin.echo',input:{message:'hello'}},'*'); };
+addEventListener('message', event => { if(event.source === parent && event.data?.type === 'rs-plugin-result') { document.getElementById('result').textContent = JSON.stringify(event.data.data ?? event.data.error,null,2); button.disabled = false; } });
+</script></html>

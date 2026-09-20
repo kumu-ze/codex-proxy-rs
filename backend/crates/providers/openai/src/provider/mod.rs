@@ -138,6 +138,7 @@ pub enum CodexProviderConfigError {
 }
 
 pub struct CodexProvider {
+    extension: Option<Arc<dyn gateway_core::engine::extensions::RequestExtension>>,
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
     quota: Arc<CodexCredentialQuotaService>,
@@ -192,6 +193,7 @@ impl CodexProvider {
         let client =
             CodexBackendClient::new(http, base_url, profile).with_websocket_pool(websocket_pool);
         Ok(Self {
+            extension: None,
             selector,
             catalog,
             quota,
@@ -209,6 +211,14 @@ impl CodexProvider {
 
     pub(crate) fn with_session_identity(mut self, identity: CodexSessionIdentity) -> Self {
         self.session_identity = Some(identity);
+        self
+    }
+
+    pub fn with_extension(
+        mut self,
+        extension: Option<Arc<dyn gateway_core::engine::extensions::RequestExtension>>,
+    ) -> Self {
+        self.extension = extension;
         self
     }
 }
@@ -549,6 +559,54 @@ impl Provider for CodexProvider {
             lease.installation_id(),
             account_scope,
         );
+        if let Some(extension) = &self.extension {
+            use gateway_core::engine::extensions::ExtensionRequest;
+            let request = ExtensionRequest {
+                provider: "openai".into(),
+                account_id: lease.account_id().as_str().into(),
+                model: upstream_model.as_str().into(),
+                credential_scope: lease.authentication().extension_scope(lease.account()),
+                authentication_kind: lease.account().authentication_kind().into(),
+                plan_type: lease.account().plan_type().map(str::to_owned),
+                account_eligible: lease.account().enabled()
+                    && lease.account().credential_state()
+                        == gateway_core::account::CredentialState::Ready,
+            };
+            let decision = extension.before_send(request).await.map_err(|_| {
+                provider_error(
+                    ProviderErrorKind::NoEligibleAccount,
+                    UpstreamSendState::NotSent,
+                )
+            })?;
+            if decision.deny {
+                return Err(provider_error(
+                    ProviderErrorKind::NoEligibleAccount,
+                    UpstreamSendState::NotSent,
+                )
+                .with_client_visible_upstream_error(
+                    ClientVisibleUpstreamError::new(
+                        "请求被已启用的扩展策略拒绝",
+                        Some("extension_denied".into()),
+                        Some("service_unavailable".into()),
+                    ),
+                ));
+            }
+            for (key, value) in decision.values {
+                if key != "session_state"
+                    || value.is_empty()
+                    || value.len() > 4096
+                    || !value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-=".contains(&b))
+                {
+                    return Err(provider_error(
+                        ProviderErrorKind::Protocol,
+                        UpstreamSendState::NotSent,
+                    ));
+                }
+                upstream_request.apply_extension_state(value);
+            }
+        }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = lease
             .account()

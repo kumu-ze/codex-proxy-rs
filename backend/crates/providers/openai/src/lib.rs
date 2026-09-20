@@ -2,6 +2,7 @@
 
 mod admin;
 pub mod config;
+mod extension_services;
 mod provider;
 mod session_transport;
 
@@ -44,6 +45,7 @@ pub use transport::{
 
 /// OpenAI 初始化后交给组装根的最小能力集。
 pub struct ProviderBundle {
+    extension_services: Arc<dyn gateway_core::engine::extensions::ExtensionServices>,
     core_provider: Arc<dyn Provider>,
     admin_provider: Arc<dyn ProviderAdmin>,
     worker_contributions: Vec<WorkerContribution>,
@@ -53,6 +55,14 @@ pub struct ProviderBundle {
 pub async fn initialize(
     config: OpenAiConfig,
     ports: ProviderStorePorts,
+) -> Result<ProviderBundle, OpenAiInitializeError> {
+    initialize_with_extension(config, ports, None).await
+}
+
+pub async fn initialize_with_extension(
+    config: OpenAiConfig,
+    ports: ProviderStorePorts,
+    extension: Option<Arc<dyn gateway_core::engine::extensions::RequestExtension>>,
 ) -> Result<ProviderBundle, OpenAiInitializeError> {
     let provider_kind =
         ProviderKind::new("openai").map_err(|_| OpenAiInitializeError::InvalidProviderKind)?;
@@ -130,6 +140,11 @@ pub async fn initialize(
     );
     platform_releases.restore().await;
     let repository = CodexCredentialRepository::new(Arc::clone(&accounts));
+    let extension_services = extension_services::OpenAiExtensionServices::new(
+        repository.clone(),
+        profile.clone(),
+        config.base_url(),
+    );
     let websocket_pool = Arc::new(CodexWebSocketPool::with_config(
         config.websocket_pool_config(),
     ));
@@ -178,7 +193,8 @@ pub async fn initialize(
             config.stream_max_retries(),
         )
         .map_err(OpenAiInitializeError::Provider)?
-        .with_session_identity(session_identity),
+        .with_session_identity(session_identity)
+        .with_extension(extension),
     );
     let token_client = Arc::new(
         credential::token_client::openai_token_client(
@@ -247,6 +263,7 @@ pub async fn initialize(
     .map_err(|_| OpenAiInitializeError::Worker)?;
 
     Ok(ProviderBundle {
+        extension_services,
         core_provider,
         admin_provider,
         worker_contributions,
@@ -254,6 +271,11 @@ pub async fn initialize(
 }
 
 impl ProviderBundle {
+    pub fn extension_services(
+        &self,
+    ) -> Arc<dyn gateway_core::engine::extensions::ExtensionServices> {
+        self.extension_services.clone()
+    }
     #[must_use]
     pub fn core_provider(&self) -> Arc<dyn Provider> {
         Arc::clone(&self.core_provider)

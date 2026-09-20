@@ -1,7 +1,7 @@
 //! Codex 明文 credential JSON 的 schema 校验与日志脱敏边界。
 
 use super::api_key::ApiKeyAuthentication;
-use gateway_core::account::PlaintextCredential;
+use gateway_core::account::{PlaintextCredential, ProviderAccount};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use thiserror::Error;
@@ -45,6 +45,45 @@ pub enum CodexRuntimeAuthentication {
 }
 
 impl CodexRuntimeAuthentication {
+    /// 扩展状态绑定真正的上游身份；Cookie、名称与调度配置更新不能改变该绑定。
+    /// OAuth 摘要沿用旧票的长度前缀合同，供独立插件迁移已有票时比对。
+    #[must_use]
+    pub fn extension_scope(&self, account: &ProviderAccount) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut hash = Sha256::new();
+        let mut append = |value: &str| {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        };
+        match self {
+            Self::OAuth(auth) => {
+                for value in [
+                    account.id().as_str(),
+                    account.upstream_account_id().unwrap_or(""),
+                    account.upstream_user_id().unwrap_or(""),
+                    auth.access_token.expose_secret(),
+                    auth.refresh_token
+                        .as_ref()
+                        .map_or("", |v| v.expose_secret()),
+                    auth.id_token.as_ref().map_or("", |v| v.expose_secret()),
+                ] {
+                    append(value);
+                }
+            }
+            Self::ApiKey(auth) => {
+                for value in [
+                    "api_key",
+                    account.id().as_str(),
+                    &auth.configuration.base_url,
+                    auth.secret.expose_secret(),
+                ] {
+                    append(value);
+                }
+            }
+        }
+        hex::encode(hash.finalize())
+    }
+
     pub fn authorization_header(&self) -> Result<SecretString, CodexCredentialDataError> {
         match self {
             Self::ApiKey(auth) => Ok(SecretString::from(format!(
