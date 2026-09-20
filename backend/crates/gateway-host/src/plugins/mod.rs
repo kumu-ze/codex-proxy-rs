@@ -1,6 +1,7 @@
 //! 受管理员信任的外部插件进程；不是执行不可信代码的操作系统沙箱。
 
 mod install;
+mod management;
 mod manifest;
 mod process;
 mod registry;

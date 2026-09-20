@@ -1,6 +1,8 @@
 mod install;
 mod manifest;
 #[cfg(unix)]
+mod management;
+#[cfg(unix)]
 mod process;
 #[cfg(unix)]
 mod registry;

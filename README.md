@@ -1,3 +1,9 @@
+> **Fork 实验版：v3.12.1-plugin.2**
+>
+> 此分支来自 [zyycn/codex-proxy-rs v3.12.1](https://github.com/zyycn/codex-proxy-rs/tree/01006380)，由 [kumu-ze/codex-proxy-rs](https://github.com/kumu-ze/codex-proxy-rs/tree/codex/plugin-host) 探索外部进程插件系统，供上游设计讨论参考。它不是上游正式发布，也不表示上游已接受本方案。
+>
+> [插件开发与接口](docs/plugins.md) · [风险、验证及未覆盖项](docs/plugins-validation.md) · [本 fork 发布说明](release/notes.md)。下方上游徽章、快速安装与演示链接仍指向官方项目，不会安装本 fork。请从本 fork 源码构建，并保留版本后缀。
+
 <!-- prettier-ignore -->
 <div align="center">
 

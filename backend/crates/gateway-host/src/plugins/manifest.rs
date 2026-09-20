@@ -22,6 +22,8 @@ pub struct PluginManifest {
     pub files: BTreeMap<String, String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menu_label: Option<String>,
 }
 
 /// 经过结构、路径和内容摘要验证的本地包。
@@ -62,6 +64,11 @@ impl PluginPackage {
                 .iter()
                 .any(|c| c != "request.openai" && c != "provider.openai")
             || manifest.capabilities.len() > 2
+            || manifest.menu_label.as_ref().is_some_and(|label| {
+                label.trim().is_empty()
+                    || label.chars().count() > 24
+                    || label.chars().any(char::is_control)
+            })
         {
             return Err(PluginError::InvalidPackage);
         }

@@ -71,9 +71,11 @@ pub async fn run() -> Result<(), BootstrapError> {
         plugins,
     } = config;
 
+    let plugin_directory = host.runtime_data_dir().join("plugins");
     let host = gateway_host::initialize(host).await?;
     host.report_startup_ready("Host");
-    let plugins = gateway_host::plugins::PluginRegistry::start(plugins).await?;
+    let plugins =
+        gateway_host::plugins::PluginRegistry::start_managed(plugins, &plugin_directory).await?;
     let mut store = gateway_store::initialize(store).await?;
     host.report_startup_ready("Store");
     let provider_ports = store.provider_ports();
