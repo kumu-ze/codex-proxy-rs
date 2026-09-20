@@ -71,3 +71,49 @@ fn chat_ui_capability_is_explicit_and_unknown_capabilities_are_rejected() {
         assert_eq!(PluginPackage::open(dir.path()).is_ok(), allowed);
     }
 }
+
+#[test]
+fn validates_display_metadata_without_enabling_unsafe_links() {
+    for (repository, author, asset, accepted) in [
+        (
+            "https://github.com/owner/plugin",
+            "Author",
+            "plugin-{version}-linux-x64.tar.gz",
+            true,
+        ),
+        (
+            "javascript:alert(1)",
+            "Author",
+            "plugin-{version}.tar.gz",
+            false,
+        ),
+        (
+            "https://user:password@github.com/owner/plugin",
+            "Author",
+            "plugin-{version}.tar.gz",
+            false,
+        ),
+        (
+            "https://github.com/owner/plugin",
+            "",
+            "plugin-{version}.tar.gz",
+            false,
+        ),
+        (
+            "https://github.com/owner/plugin",
+            "Author",
+            "../plugin-{version}.tar.gz",
+            false,
+        ),
+    ] {
+        let dir = super::package(b"worker");
+        let path = dir.path().join("plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["repository"] = serde_json::json!(repository);
+        manifest["author"] = serde_json::json!(author);
+        manifest["releaseAsset"] = serde_json::json!(asset);
+        std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(PluginPackage::open(dir.path()).is_ok(), accepted);
+    }
+}

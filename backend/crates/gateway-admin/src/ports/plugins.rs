@@ -13,6 +13,21 @@ pub struct PluginStatus {
     pub enabled: bool,
     pub menu_label: Option<String>,
     pub capabilities: Vec<String>,
+    pub author: Option<String>,
+    pub repository: Option<String>,
+    pub update_supported: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginUpdateInfo {
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub release_url: Option<String>,
+    pub download_url: Option<String>,
+    pub sha256: Option<String>,
+    pub prerelease: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -47,6 +62,10 @@ pub enum PluginOperationError {
     Unavailable,
     #[error("plugin package download or validation failed")]
     Package,
+    #[error("existing plugin package differs from requested package")]
+    PackageConflict,
+    #[error("invalid update source response")]
+    UpdateSource,
     #[error("plugin download failed")]
     Download,
     #[error("plugin download timed out")]
@@ -66,6 +85,13 @@ pub enum PluginOperationError {
 #[async_trait]
 pub trait PluginOperations: Send + Sync {
     async fn list(&self) -> Vec<PluginStatus>;
+    async fn check_update(
+        &self,
+        _id: &str,
+        _proxy_id: Option<&str>,
+    ) -> Result<PluginUpdateInfo, PluginOperationError> {
+        Err(PluginOperationError::Invalid)
+    }
     async fn manage(&self, _operation: PluginManagement) -> Result<(), PluginOperationError> {
         Err(PluginOperationError::Unavailable)
     }

@@ -1,6 +1,7 @@
 import { API_BASE_URL } from '@/api/constants'
 import { getApiKeys, revealApiKey } from '@/api/modules/api-keys'
 import { getPlugins } from '@/api/modules/plugins'
+import { renderChatMarkdown } from './chatMarkdown'
 
 interface Message { role: 'user' | 'assistant', content: string }
 interface JobResult {
@@ -13,7 +14,7 @@ interface JobResult {
   elapsedMs?: number
   usage?: Record<string, number>
 }
-interface Job { result: JobResult, controller: AbortController }
+interface Job { result: JobResult, controller: AbortController, renderedText?: string, renderedHtml?: string }
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -255,7 +256,11 @@ export function createGatewayChatBridge(pluginId: string) {
     else if (method !== 'chat.poll') {
       throw new Error('不支持的页面操作')
     }
-    return { ...job.result }
+    if (job.renderedText !== job.result.text) {
+      job.renderedHtml = renderChatMarkdown(job.result.text)
+      job.renderedText = job.result.text
+    }
+    return { ...job.result, html: job.renderedHtml || '' }
   }
   return { invoke, dispose }
 }

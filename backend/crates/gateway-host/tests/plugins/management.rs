@@ -363,3 +363,124 @@ async fn installation_uses_selected_proxy_and_reports_download_failure_types() {
     registry.shutdown().await;
     server.abort();
 }
+#[tokio::test]
+async fn restores_unregistered_identical_package_without_resetting_data() {
+    let source = super::package(SCRIPT);
+    let root = tempfile::tempdir().unwrap();
+    gateway_host::plugins::install_package(source.path(), &root.path().join("packages")).unwrap();
+    let data = root.path().join("data/example");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("saved"), "preserved").unwrap();
+    let (url, server) = serve(archive(source.path(), false)).await;
+    let registry = PluginRegistry::start_managed(vec![], root.path())
+        .await
+        .unwrap();
+    registry
+        .manage(PluginManagement::Install {
+            url,
+            sha256: None,
+            proxy_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(!registry.list().await[0].enabled);
+    assert_eq!(
+        std::fs::read_to_string(data.join("saved")).unwrap(),
+        "preserved"
+    );
+    registry
+        .manage(PluginManagement::Enable {
+            id: "example".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        registry
+            .invoke("example", "admin.echo", json!({"ok":true}))
+            .await
+            .unwrap(),
+        json!({"ok":true})
+    );
+    registry.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn refuses_different_or_extra_or_tampered_orphan_content_without_overwriting() {
+    use gateway_admin::ports::plugins::PluginOperationError;
+    for change in ["manifest", "extra", "tamper"] {
+        let source = super::package(SCRIPT);
+        let root = tempfile::tempdir().unwrap();
+        gateway_host::plugins::install_package(source.path(), &root.path().join("packages"))
+            .unwrap();
+        let target = root.path().join("packages/example-1.0.0");
+        match change {
+            "manifest" => {
+                let path = target.join("plugin.json");
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                value["menuLabel"] = json!("different");
+                std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "extra" => std::fs::write(target.join("unexpected"), "retained").unwrap(),
+            _ => std::fs::write(target.join("worker"), "changed").unwrap(),
+        }
+        let original = std::fs::read(target.join("worker")).unwrap();
+        let (url, server) = serve(archive(source.path(), false)).await;
+        let registry = PluginRegistry::start_managed(vec![], root.path())
+            .await
+            .unwrap();
+        assert!(matches!(
+            registry
+                .manage(PluginManagement::Install {
+                    url,
+                    sha256: None,
+                    proxy_id: None
+                })
+                .await,
+            Err(PluginOperationError::PackageConflict)
+        ));
+        assert!(registry.list().await.is_empty());
+        assert_eq!(std::fs::read(target.join("worker")).unwrap(), original);
+        if change == "extra" {
+            assert!(target.join("unexpected").exists());
+        }
+        registry.shutdown().await;
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn failed_registration_preserves_reused_package() {
+    use gateway_admin::ports::plugins::PluginOperationError;
+    let source = super::package(SCRIPT);
+    let root = tempfile::tempdir().unwrap();
+    gateway_host::plugins::install_package(source.path(), &root.path().join("packages")).unwrap();
+    let registry = PluginRegistry::start_managed(vec![], root.path())
+        .await
+        .unwrap();
+    std::fs::rename(
+        root.path().join("registry.json"),
+        root.path().join("saved-registry.json"),
+    )
+    .unwrap();
+    std::fs::create_dir(root.path().join("registry.json")).unwrap();
+    let (url, server) = serve(archive(source.path(), false)).await;
+    assert!(matches!(
+        registry
+            .manage(PluginManagement::Install {
+                url,
+                sha256: None,
+                proxy_id: None
+            })
+            .await,
+        Err(PluginOperationError::Storage)
+    ));
+    assert!(
+        gateway_host::plugins::PluginPackage::open(&root.path().join("packages/example-1.0.0"))
+            .is_ok()
+    );
+    assert!(registry.list().await.is_empty());
+    registry.shutdown().await;
+    server.abort();
+}

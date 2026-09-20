@@ -1,4 +1,4 @@
-> **Fork 实验版：v3.12.1-plugin.5**
+> **Fork 实验版：v3.12.1-plugin.6**
 >
 > 此分支来自 [zyycn/codex-proxy-rs v3.12.1](https://github.com/zyycn/codex-proxy-rs/tree/01006380)，由 [kumu-ze/codex-proxy-rs](https://github.com/kumu-ze/codex-proxy-rs/tree/codex/plugin-host) 探索外部进程插件系统，供上游设计讨论参考。它不是上游正式发布，也不表示上游已接受本方案。
 >

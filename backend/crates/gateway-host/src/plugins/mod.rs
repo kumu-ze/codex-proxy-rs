@@ -6,6 +6,7 @@ mod manifest;
 mod process;
 mod registry;
 mod services;
+mod updates;
 
 pub use install::install_package;
 pub use manifest::{PluginManifest, PluginPackage};
@@ -17,6 +18,8 @@ pub use registry::{PluginConfig, PluginRegistry};
 pub enum PluginError {
     #[error("invalid plugin package")]
     InvalidPackage,
+    #[error("existing plugin package differs from requested package")]
+    ExistingPackage,
     #[error("plugin download failed")]
     Download,
     #[error("plugin download timed out")]

@@ -12,7 +12,7 @@ use super::PluginError;
 const MAX_PACKAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// API 主版本不兼容时拒绝加载；安装器只复制摘要清单明确列出的文件。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PluginManifest {
     pub id: String,
@@ -24,6 +24,12 @@ pub struct PluginManifest {
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub menu_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_asset: Option<String>,
 }
 
 /// 经过结构、路径和内容摘要验证的本地包。
@@ -64,6 +70,23 @@ impl PluginPackage {
                 .iter()
                 .any(|c| c != "request.openai" && c != "provider.openai" && c != "ui.chat")
             || manifest.capabilities.len() > 3
+            || manifest.author.as_ref().is_some_and(|author| {
+                author.trim().is_empty()
+                    || author.chars().count() > 100
+                    || author.chars().any(char::is_control)
+            })
+            || manifest
+                .repository
+                .as_ref()
+                .is_some_and(|url| !valid_repository(url))
+            || manifest.release_asset.as_ref().is_some_and(|asset| {
+                asset.is_empty()
+                    || asset.len() > 200
+                    || !asset.contains("{version}")
+                    || !asset
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"-_.{}".contains(&c))
+            })
             || manifest.menu_label.as_ref().is_some_and(|label| {
                 label.trim().is_empty()
                     || label.chars().count() > 24
@@ -128,4 +151,17 @@ fn checked_file(root: &Path, name: &str) -> Result<PathBuf, PluginError> {
         return Err(PluginError::InvalidPackage);
     }
     Ok(current)
+}
+
+fn valid_repository(value: &str) -> bool {
+    if value.len() > 2048 {
+        return false;
+    }
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+    })
 }

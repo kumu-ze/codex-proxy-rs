@@ -68,3 +68,62 @@ pub fn install_package(source: &Path, destination: &Path) -> Result<PluginPackag
     }
     result
 }
+
+/// 仅用于未登记 ID 的恢复：不覆盖任何旧文件，也不复用带额外文件的目录。
+pub(super) fn restore_or_install_package(
+    source: &Path,
+    destination: &Path,
+) -> Result<(PluginPackage, bool), PluginError> {
+    let requested = PluginPackage::open(source)?;
+    let target = destination.join(format!(
+        "{}-{}",
+        requested.manifest().id,
+        requested.manifest().version
+    ));
+    match fs::symlink_metadata(&target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return install_package(source, destination).map(|package| (package, true));
+        }
+        Err(_) => return Err(PluginError::Io),
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(PluginError::ExistingPackage);
+        }
+        Ok(_) => {}
+    }
+    let existing = PluginPackage::open(&target).map_err(|_| PluginError::ExistingPackage)?;
+    if existing.manifest() != requested.manifest() {
+        return Err(PluginError::ExistingPackage);
+    }
+    let expected: std::collections::BTreeSet<std::path::PathBuf> = requested
+        .manifest()
+        .files
+        .keys()
+        .map(|name| Path::new(name).components().collect())
+        .chain(std::iter::once(std::path::PathBuf::from("plugin.json")))
+        .collect();
+    let mut directories = vec![existing.root().to_path_buf()];
+    let mut visited = 0;
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory).map_err(|_| PluginError::Io)? {
+            let entry = entry.map_err(|_| PluginError::Io)?;
+            visited += 1;
+            if visited > 4096 {
+                return Err(PluginError::ExistingPackage);
+            }
+            let kind = entry.file_type().map_err(|_| PluginError::Io)?;
+            if kind.is_dir() {
+                directories.push(entry.path());
+            } else if !kind.is_file()
+                || !expected.contains(
+                    entry
+                        .path()
+                        .strip_prefix(existing.root())
+                        .map_err(|_| PluginError::ExistingPackage)?,
+                )
+            {
+                return Err(PluginError::ExistingPackage);
+            }
+        }
+    }
+    Ok((existing, false))
+}

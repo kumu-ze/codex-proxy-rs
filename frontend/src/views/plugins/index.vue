@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import type { PluginManagement, PluginStatus } from '@/api/modules/plugins'
-import { useEventListener } from '@vueuse/core'
+import type { PluginManagement, PluginStatus, PluginUpdateInfo } from '@/api/modules/plugins'
+import { useClipboard, useEventListener } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { invokePlugin, managePlugin } from '@/api/modules/plugins'
+import { checkPluginUpdate, invokePlugin, managePlugin } from '@/api/modules/plugins'
 import { getProxies } from '@/api/modules/proxies'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
@@ -26,12 +26,60 @@ const pageId = computed(() => typeof route.params.id === 'string' ? route.params
 const busy = ref(false)
 const failure = ref('')
 const installOpen = ref(false)
+const updateOpen = ref(false)
+const downloadProxy = ref('')
+const notice = ref('')
+const updateTarget = ref<PluginStatus>()
+const updateInfo = ref<PluginUpdateInfo>()
+const updateError = ref('')
+const checkingUpdate = ref(false)
+const { copy } = useClipboard({ legacy: true })
+let updateGeneration = 0
+async function checkUpdate() {
+  const plugin = updateTarget.value
+  if (!plugin)
+    return
+  const current = ++updateGeneration
+  checkingUpdate.value = true
+  updateError.value = ''
+  updateInfo.value = undefined
+  try {
+    const info = await checkPluginUpdate(plugin.id, downloadProxy.value || undefined)
+    if (current === updateGeneration)
+      updateInfo.value = info
+  }
+  catch (error) {
+    if (current === updateGeneration)
+      updateError.value = error instanceof Error ? error.message : '检查更新失败'
+  }
+  finally {
+    if (current === updateGeneration)
+      checkingUpdate.value = false
+  }
+}
+function openUpdate(plugin: PluginStatus) {
+  updateTarget.value = plugin
+  updateOpen.value = true
+  void checkUpdate()
+}
+watch(updateOpen, (open) => {
+  if (!open) {
+    ++updateGeneration
+    checkingUpdate.value = false
+  }
+})
+async function copyUpdateLink() {
+  if (updateInfo.value?.downloadUrl) {
+    await copy(updateInfo.value.downloadUrl)
+    notice.value = '已复制新版本安装链接。更新前请先停用并卸载当前版本，数据会保留。'
+    updateOpen.value = false
+  }
+}
 const downloadUrl = ref('')
 const checksum = ref('')
-const downloadProxy = ref('')
 const proxyOptions = ref<{ label: string, value: string }[]>([{ label: '直连（不使用代理）', value: '' }])
-watch(installOpen, async (opened) => {
-  if (!opened)
+watch([installOpen, updateOpen], async ([installing, updating]) => {
+  if (!installing && !updating)
     return
   try {
     const options = [{ label: '直连（不使用代理）', value: '' }]
@@ -48,7 +96,6 @@ watch(installOpen, async (opened) => {
 const confirmOpen = ref(false)
 const target = ref<PluginStatus>()
 const action = ref<'enable' | 'disable' | 'uninstall'>('disable')
-const notice = ref('')
 const frameHeight = ref(720)
 const confirmation = computed(() => action.value === 'enable' ? '启用插件后，其程序将运行并参与请求处理。请只启用可信来源的插件。' : action.value === 'disable' ? '停用后插件进程和自动任务停止，新请求不再使用该插件提供的处理与保护。' : '移除插件及菜单入口，保留业务数据。重新安装后可以恢复使用。')
 const actionLabel = computed(() => ({ enable: '启用', disable: '停用', uninstall: '卸载' })[action.value])
@@ -220,6 +267,10 @@ watch(pageId, async (id) => {
               {{ plugin.menuLabel || plugin.id }}
             </h2>
             <span class="text-sm text-cp-text-secondary">{{ plugin.id }} · {{ plugin.version }}</span>
+            <div class="mt-1 flex flex-wrap gap-3 text-sm text-cp-text-secondary">
+              <span>作者：{{ plugin.author || '未提供' }}</span>
+              <a v-if="plugin.repository" :href="plugin.repository" target="_blank" rel="noopener noreferrer" class="text-cp-primary-text">源码仓库</a>
+            </div>
           </div>
           <BaseTag :type="plugin.available ? 'success' : 'warning'">
             {{ !plugin.enabled ? '已停用' : plugin.available ? '运行中' : '启动失败' }}
@@ -233,6 +284,9 @@ watch(pageId, async (id) => {
             </BaseButton>
             <BaseButton v-if="plugin.enabled" :disabled="busy" @click="ask(plugin, 'disable')">
               停用
+            </BaseButton>
+            <BaseButton :disabled="!plugin.updateSupported || busy" :title="plugin.updateSupported ? '从发布仓库检查新版本' : '此包未声明受支持的更新源'" @click="openUpdate(plugin)">
+              检查更新
             </BaseButton>
             <BaseButton variant="ghost" :disabled="plugin.enabled || busy" :title="plugin.enabled ? '请先停用插件' : '卸载并保留数据'" @click="ask(plugin, 'uninstall')">
               卸载
@@ -265,7 +319,7 @@ watch(pageId, async (id) => {
           <BaseInput id="plugin-sha" v-model="checksum" pattern="[a-fA-F0-9]{64}" placeholder="发布者提供的文件校验值" :disabled="busy" />
         </FormItem>
         <p class="text-sm text-cp-text-secondary">
-          只安装可信来源的原生插件。最大 128 MB；支持 HTTP / HTTPS 直链与重定向。GitHub 仓库页面不是插件包下载地址。
+          只安装可信来源的原生插件。最大 128 MB；支持 HTTP / HTTPS 直链与重定向。请使用 Release 附件的 tar.gz 直链，仓库主页和源码 ZIP 不是插件包。
         </p>
         <p v-if="busy" role="status">
           正在下载并校验，请稍候…
@@ -279,6 +333,42 @@ watch(pageId, async (id) => {
           取消
         </BaseButton><BaseButton type="submit" form="install-plugin" variant="primary" :loading="busy" :disabled="!downloadUrl.trim()">
           下载安装
+        </BaseButton>
+      </template>
+    </BaseModal>
+    <BaseModal v-model="updateOpen" :title="`${updateTarget?.menuLabel || updateTarget?.id || '插件'} · 检查更新`">
+      <div class="space-y-4">
+        <p class="text-cp-text-secondary">
+          当前版本：{{ updateTarget?.version }}
+        </p>
+        <FormItem label="访问代理" description="用于访问 GitHub 发布接口。">
+          <BaseSelect v-model="downloadProxy" :options="proxyOptions" :disabled="checkingUpdate" />
+        </FormItem>
+        <p v-if="checkingUpdate" role="status">
+          正在检查更新…
+        </p>
+        <p v-if="updateError" role="alert" class="text-cp-error-text">
+          {{ updateError }}
+        </p>
+        <template v-if="updateInfo">
+          <p role="status">
+            {{ updateInfo.updateAvailable ? `发现新版本 ${updateInfo.latestVersion}` : updateInfo.latestVersion ? '当前已是最新可用版本' : '仓库暂未提供匹配的发布包' }}{{ updateInfo.prerelease ? '（预发布）' : '' }}
+          </p>
+          <a v-if="updateInfo.releaseUrl" :href="updateInfo.releaseUrl" target="_blank" rel="noopener noreferrer" class="text-cp-primary-text">查看发布说明</a>
+          <p v-if="updateInfo.updateAvailable" class="text-sm text-cp-text-secondary">
+            复制安装链接后，停用并卸载当前版本，再安装新包。现有插件数据会保留。
+          </p>
+          <p v-if="updateInfo.sha256" class="break-all text-xs text-cp-text-secondary">
+            SHA256：{{ updateInfo.sha256 }}
+          </p>
+        </template>
+      </div>
+      <template #footer>
+        <BaseButton :disabled="checkingUpdate" @click="checkUpdate">
+          重新检查
+        </BaseButton>
+        <BaseButton v-if="updateInfo?.updateAvailable && updateInfo.downloadUrl" variant="primary" @click="copyUpdateLink">
+          复制安装链接
         </BaseButton>
       </template>
     </BaseModal>

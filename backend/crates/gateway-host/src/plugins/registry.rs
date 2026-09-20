@@ -2,7 +2,7 @@ use super::management::{Catalog, Record};
 use super::{PluginError, PluginPackage, PluginProcess};
 use async_trait::async_trait;
 use gateway_admin::ports::plugins::{
-    PluginManagement, PluginOperationError, PluginOperations, PluginStatus,
+    PluginManagement, PluginOperationError, PluginOperations, PluginStatus, PluginUpdateInfo,
 };
 use gateway_core::engine::extensions::{
     ExtensionDecision, ExtensionRequest, ExtensionUnavailable, RequestExtension,
@@ -48,6 +48,9 @@ struct Entry {
     version: String,
     menu_label: Option<String>,
     capabilities: Vec<String>,
+    author: Option<String>,
+    repository: Option<String>,
+    release_asset: Option<String>,
     process: Mutex<Option<PluginProcess>>,
     enabled: AtomicBool,
     available: AtomicBool,
@@ -119,6 +122,9 @@ impl PluginRegistry {
                     version: package.manifest().version.clone(),
                     menu_label: package.manifest().menu_label.clone(),
                     capabilities: package.manifest().capabilities.clone(),
+                    author: package.manifest().author.clone(),
+                    repository: package.manifest().repository.clone(),
+                    release_asset: package.manifest().release_asset.clone(),
                     process: Mutex::new(None),
                     enabled: AtomicBool::new(record.enabled),
                     available: AtomicBool::new(false),
@@ -316,8 +322,14 @@ impl PluginRegistry {
                 {
                     return Err(PluginOperationError::Invalid);
                 }
-                let package = super::install_package(&staged.path, &packages)
-                    .map_err(|_| PluginOperationError::Package)?;
+                let (package, created) =
+                    super::install::restore_or_install_package(&staged.path, &packages).map_err(
+                        |error| match error {
+                            PluginError::ExistingPackage => PluginOperationError::PackageConflict,
+                            PluginError::Io => PluginOperationError::Storage,
+                            _ => PluginOperationError::Package,
+                        },
+                    )?;
                 let entry = Arc::new(Entry {
                     config: PluginConfig {
                         directory: package.root().into(),
@@ -333,13 +345,18 @@ impl PluginRegistry {
                     version: package.manifest().version.clone(),
                     menu_label: package.manifest().menu_label.clone(),
                     capabilities: package.manifest().capabilities.clone(),
+                    author: package.manifest().author.clone(),
+                    repository: package.manifest().repository.clone(),
+                    release_asset: package.manifest().release_asset.clone(),
                     process: Mutex::new(None),
                     enabled: AtomicBool::new(false),
                     available: AtomicBool::new(false),
                 });
                 entries.insert(id.clone(), entry);
                 if self.save(&entries, None).is_err() {
-                    let _ = std::fs::remove_dir_all(package.root());
+                    if created {
+                        let _ = std::fs::remove_dir_all(package.root());
+                    }
                     return Err(PluginOperationError::Storage);
                 }
                 *self.entries.write().await = entries;
@@ -488,12 +505,54 @@ impl PluginOperations for PluginRegistry {
                     version: entry.version.clone(),
                     menu_label: entry.menu_label.clone(),
                     capabilities: entry.capabilities.clone(),
+                    author: entry.author.clone(),
+                    repository: entry.repository.clone(),
+                    update_supported: entry
+                        .repository
+                        .as_deref()
+                        .and_then(super::updates::github_repository)
+                        .is_some()
+                        && entry.release_asset.is_some(),
                     available: entry.available.load(Ordering::Acquire),
                     enabled: entry.enabled.load(Ordering::Acquire),
                 }
             })
             .collect()
     }
+    async fn check_update(
+        &self,
+        id: &str,
+        proxy_id: Option<&str>,
+    ) -> Result<PluginUpdateInfo, PluginOperationError> {
+        let entries = self.snapshot().await;
+        let entry = entries.get(id).ok_or(PluginOperationError::NotFound)?;
+        let repository = entry
+            .repository
+            .as_deref()
+            .and_then(super::updates::github_repository)
+            .ok_or(PluginOperationError::Invalid)?;
+        let asset = entry
+            .release_asset
+            .as_deref()
+            .ok_or(PluginOperationError::Invalid)?;
+        let proxy = if let Some(id) = proxy_id {
+            let services = self.services.get().ok_or(PluginOperationError::Proxy)?;
+            let value = services
+                .invoke("proxies.resolve", serde_json::json!({"id":id}))
+                .await
+                .map_err(|_| PluginOperationError::Proxy)?;
+            Some(
+                value
+                    .as_str()
+                    .ok_or(PluginOperationError::Proxy)?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        super::updates::check(&repository, asset, &entry.version, proxy.as_deref()).await
+    }
+
     async fn invoke(
         &self,
         id: &str,

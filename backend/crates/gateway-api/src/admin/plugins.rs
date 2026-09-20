@@ -19,6 +19,7 @@ pub(super) fn router<S: SessionState + Clone + Send + Sync + 'static>() -> Route
         .route("/api/admin/plugins", get(list::<S>))
         .route("/api/admin/plugins/invoke", post(invoke::<S>))
         .route("/api/admin/plugins/manage", post(manage::<S>))
+        .route("/api/admin/plugins/check-update", post(check_update::<S>))
 }
 
 async fn list<S: SessionState + Send + Sync>(
@@ -66,6 +67,12 @@ fn operation_error(error: PluginOperationError) -> AdminError {
         PluginOperationError::Package => {
             AdminError::bad_request("插件包格式或内容校验失败：请提供兼容 API 1 的 tar.gz 插件包")
         }
+        PluginOperationError::UpdateSource => {
+            AdminError::bad_request("更新源返回的数据无效或超过大小限制")
+        }
+        PluginOperationError::PackageConflict => AdminError::bad_request(
+            "未登记的同版本安装目录已存在，但内容不一致或损坏；请清理旧目录或使用新版本包",
+        ),
         PluginOperationError::Download => {
             AdminError::bad_request("下载连接失败：请检查网络或选择可用的下载代理")
         }
@@ -104,4 +111,27 @@ async fn manage<S: SessionState + Send + Sync>(
         StatusCode::OK,
         AdminEnvelope::ok(plugins.list().await),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateQuery {
+    id: String,
+    proxy_id: Option<String>,
+}
+
+async fn check_update<S: SessionState + Send + Sync>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(body): AdminJson<UpdateQuery>,
+) -> Result<impl IntoResponse, AdminError> {
+    let services = state.admin_services();
+    let plugins = services
+        .plugins()
+        .ok_or_else(AdminError::service_unavailable)?;
+    let data = plugins
+        .check_update(&body.id, body.proxy_id.as_deref())
+        .await
+        .map_err(operation_error)?;
+    Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(data)))
 }
