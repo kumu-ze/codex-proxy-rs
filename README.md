@@ -1,3 +1,9 @@
+> **当前内置打标 fork 构建：`v3.12.1-ticket.1`，上游基线：`v3.12.1`。**
+>
+> `codex/rs-3.11-ticket` 沿用最初开发时的分支名；本分支已合并上游 `3.12.1`，并非停留在 `3.11`。`release/version.yaml` 记录上游基线版本，部署构建使用 `CPR_VERSION=3.12.1-ticket.1` 标识本 fork。
+>
+> 独立插件系统见 [`codex/plugin-host`](https://github.com/kumu-ze/codex-proxy-rs/tree/codex/plugin-host)，对话参考插件源码和安装说明见 [`examples/plugins/chat`](https://github.com/kumu-ze/codex-proxy-rs/tree/codex/plugin-host/examples/plugins/chat)。
+
 <!-- prettier-ignore -->
 <div align="center">
 
