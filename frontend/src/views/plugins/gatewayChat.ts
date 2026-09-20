@@ -220,7 +220,7 @@ export function createGatewayChatBridge(pluginId: string) {
     const input = record(value)
     if (method === 'chat.context') {
       await permission()
-      return { baseUrl: `${window.location.origin}${API_BASE_URL}`, keys: await keys() }
+      return { baseUrl: `${window.location.origin}${API_BASE_URL}/v1`, keys: await keys() }
     }
     if (method === 'chat.start') {
       if (typeof input.keyId !== 'string' || input.keyId.length > 128 || !['models', 'chat'].includes(String(input.kind)))

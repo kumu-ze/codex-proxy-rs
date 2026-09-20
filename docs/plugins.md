@@ -2,9 +2,9 @@
 
 ## 版本与定位
 
-宿主版本 **3.12.1-plugin.4**，基于上游 **v3.12.1 / 01006380**。代码位于 kumu-ze/codex-proxy-rs 的 codex/plugin-host 分支；本方案用于提供上游设计参考，不代表上游已经接受插件 API。API 主版本目前为 1，仍可能在后续实验版发生不兼容变化。构建默认读取 release/version.yaml，不要把 CPR_VERSION 改成无后缀的官方版本。
+宿主版本 **3.12.1-plugin.5**，基于上游 **v3.12.1 / 01006380**。代码位于 kumu-ze/codex-proxy-rs 的 codex/plugin-host 分支；本方案用于提供上游设计参考，不代表上游已经接受插件 API。API 主版本目前为 1，仍可能在后续实验版发生不兼容变化。构建默认读取 release/version.yaml，不要把 CPR_VERSION 改成无后缀的官方版本。
 
-独立示例为 examples/plugins/echo，另有 [对话测试插件](../examples/plugins/chat/README.md)；完整 Turn-State 插件位于独立的公开仓库 [kumu-ze/rs-turn-state-plugin](https://github.com/kumu-ze/rs-turn-state-plugin)，可从其 Release 获取插件包；上游评审可分别运行 echo、宿主测试和独立业务工作流。宿主不引用该业务 crate，也不内置其策略、调度、页面或数据模型。
+参考实现汇总见 [插件示例索引](../examples/plugins/README.md)，可在上游 PR 中引用。独立示例为 examples/plugins/echo，另有 [对话测试插件](../examples/plugins/chat/README.md)；完整 Turn-State 插件位于独立的公开仓库 [kumu-ze/rs-turn-state-plugin](https://github.com/kumu-ze/rs-turn-state-plugin)，可从其 Release 获取插件包；上游评审可分别运行 echo、宿主测试和独立业务工作流。宿主不引用该业务 crate，也不内置其策略、调度、页面或数据模型。
 
 ## 架构与调用关系
 
@@ -13,6 +13,9 @@ flowchart LR
   Nav[宿主侧栏 /extensions/:id] --> Frame[不透明来源 iframe]
   Frame -->|postMessage admin.*| UI[宿主管理前端]
   UI -->|管理员会话| API[gateway-api 固定插件路由]
+  UI -->|ui.chat 使用选定 Key| Gateway[标准 /v1 模型与 Responses 接口]
+  Gateway --> Core[Core 鉴权 / 分组 / 路由 / 计量]
+  Core --> OpenAI
   API --> Port[gateway-admin PluginOperations]
   Port --> Host[gateway-host PluginRegistry]
   Host -->|stdin/stdout JSON-RPC| Worker[原生插件进程]
@@ -166,7 +169,7 @@ credentialScope 为 Provider 对账号及真实认证材料的不可逆摘要；
 
 ## 对话测试插件
 
-`examples/plugins/chat` 版本 0.2.0，要求宿主 3.12.1-plugin.4，声明 `ui.chat` 能力。原生进程只实现 initialize/admin.ui，页面不再输入密钥或内网端口。宿主从当前浏览器 origin（开发环境附加 /dev 前缀）确定 `/v1/models`、`/v1/responses` 地址，读取已启用 Key 的 ID/名称/前缀；唯一 Key 默认选中，多个 Key 由用户选择。
+`examples/plugins/chat` 版本 0.2.1，最低宿主 3.12.1-plugin.4，推荐使用显示完整 API 地址的 3.12.1-plugin.5，声明 `ui.chat` 能力。原生进程只实现 initialize/admin.ui，页面不再输入密钥或内网端口。宿主从当前浏览器 origin（开发环境附加 /dev 前缀）确定 `/v1/models`、`/v1/responses` 地址，读取已启用 Key 的 ID/名称/前缀；唯一 Key 默认选中，多个 Key 由用户选择。
 
 页面通过 `rs-plugin-host-call` 消息调用 chat.context/start/poll/cancel，回复为 rs-plugin-host-result。宿主校验消息来源窗口与当前插件绑定；context 和每个请求任务都回读插件是否仍启用、可用且具有 ui.chat 权限。Key 必须在当前已启用列表中，宿主按 ID 获取明文后仅用于同源 fetch，拒绝重定向。密钥不发送到 iframe 或原生插件；也不持久化。普通 admin.* 进程桥继续独立运行，插件不能自行选择任意宿主接口。
 
