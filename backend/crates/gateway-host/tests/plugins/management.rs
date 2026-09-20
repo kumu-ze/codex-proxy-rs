@@ -58,7 +58,11 @@ async fn url_install_enable_disable_restart_uninstall_and_reinstall_keep_data() 
     let registry = PluginRegistry::start_managed(vec![], root.path())
         .await
         .unwrap();
-    let install = PluginManagement::Install { url, sha256: None };
+    let install = PluginManagement::Install {
+        url,
+        sha256: None,
+        proxy_id: None,
+    };
     registry.manage(install.clone()).await.unwrap();
     assert!(!registry.list().await[0].enabled);
     assert!(registry.manage(install.clone()).await.is_err());
@@ -151,7 +155,11 @@ async fn invalid_downloads_leave_registry_and_existing_plugin_unchanged() {
         let (url, server) = serve(bytes).await;
         assert!(
             registry
-                .manage(PluginManagement::Install { url, sha256 })
+                .manage(PluginManagement::Install {
+                    url,
+                    sha256,
+                    proxy_id: None
+                })
                 .await
                 .is_err()
         );
@@ -175,7 +183,8 @@ async fn invalid_downloads_leave_registry_and_existing_plugin_unchanged() {
             registry
                 .manage(PluginManagement::Install {
                     url: url.into(),
-                    sha256: None
+                    sha256: None,
+                    proxy_id: None,
                 })
                 .await
                 .is_err()
@@ -278,13 +287,79 @@ async fn url_install_rejects_overlap_with_imported_data_directory() {
     let (url, server) = serve(archive(package.path(), false)).await;
     assert!(
         registry
-            .manage(PluginManagement::Install { url, sha256: None })
+            .manage(PluginManagement::Install {
+                url,
+                sha256: None,
+                proxy_id: None
+            })
             .await
             .is_err()
     );
     assert_eq!(registry.list().await.len(), 1);
     assert!(registry.list().await[0].available);
     assert!(!root.path().join("packages/example-1.0.0").exists());
+    registry.shutdown().await;
+    server.abort();
+}
+#[tokio::test]
+async fn installation_uses_selected_proxy_and_reports_download_failure_types() {
+    use gateway_admin::ports::plugins::PluginOperationError;
+    use gateway_core::engine::extensions::{ExtensionServices, ExtensionUnavailable};
+    use std::sync::Arc;
+    struct ProxyService(String);
+    #[async_trait::async_trait]
+    impl ExtensionServices for ProxyService {
+        async fn invoke(
+            &self,
+            method: &str,
+            input: serde_json::Value,
+        ) -> Result<serde_json::Value, ExtensionUnavailable> {
+            assert_eq!(method, "proxies.resolve");
+            assert_eq!(input["id"], "chosen");
+            Ok(json!(self.0))
+        }
+    }
+    let package = super::package(SCRIPT);
+    let root = tempfile::tempdir().unwrap();
+    let (url, server) = serve(archive(package.path(), false)).await;
+    let proxy = url.trim_end_matches("/package").to_owned();
+    let mut destination = reqwest::Url::parse(&url).unwrap();
+    destination.set_port(Some(1)).unwrap();
+    let registry = PluginRegistry::start_managed(vec![], root.path())
+        .await
+        .unwrap();
+    registry
+        .attach_services(Arc::new(ProxyService(proxy)))
+        .unwrap();
+    let operation = PluginManagement::Install {
+        url: destination.to_string(),
+        sha256: None,
+        proxy_id: Some("chosen".into()),
+    };
+    registry.manage(operation).await.unwrap();
+    assert_eq!(registry.list().await[0].id, "example");
+    assert!(!registry.list().await[0].enabled);
+    let error = registry
+        .manage(PluginManagement::Install {
+            url,
+            sha256: Some("0".repeat(64)),
+            proxy_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PluginOperationError::Checksum));
+    let error = registry
+        .manage(PluginManagement::Install {
+            url: destination.to_string(),
+            sha256: None,
+            proxy_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PluginOperationError::Download | PluginOperationError::DownloadTimeout
+    ));
     registry.shutdown().await;
     server.abort();
 }

@@ -2,9 +2,9 @@
 
 ## 版本与定位
 
-宿主版本 **3.12.1-plugin.2**，基于上游 **v3.12.1 / 01006380**。代码位于 kumu-ze/codex-proxy-rs 的 codex/plugin-host 分支；本方案用于提供上游设计参考，不代表上游已经接受插件 API。API 主版本目前为 1，仍可能在后续实验版发生不兼容变化。构建默认读取 release/version.yaml，不要把 CPR_VERSION 改成无后缀的官方版本。
+宿主版本 **3.12.1-plugin.3**，基于上游 **v3.12.1 / 01006380**。代码位于 kumu-ze/codex-proxy-rs 的 codex/plugin-host 分支；本方案用于提供上游设计参考，不代表上游已经接受插件 API。API 主版本目前为 1，仍可能在后续实验版发生不兼容变化。构建默认读取 release/version.yaml，不要把 CPR_VERSION 改成无后缀的官方版本。
 
-独立示例为 examples/plugins/echo；完整 Turn-State 插件位于独立的公开仓库 [kumu-ze/rs-turn-state-plugin](https://github.com/kumu-ze/rs-turn-state-plugin)，可从其 Release 获取插件包；上游评审可分别运行 echo、宿主测试和独立业务工作流。宿主不引用该业务 crate，也不内置其策略、调度、页面或数据模型。
+独立示例为 examples/plugins/echo，另有 [对话测试插件](../examples/plugins/chat/README.md)；完整 Turn-State 插件位于独立的公开仓库 [kumu-ze/rs-turn-state-plugin](https://github.com/kumu-ze/rs-turn-state-plugin)，可从其 Release 获取插件包；上游评审可分别运行 echo、宿主测试和独立业务工作流。宿主不引用该业务 crate，也不内置其策略、调度、页面或数据模型。
 
 ## 架构与调用关系
 
@@ -62,7 +62,7 @@ id 为 1–64 个小写字母、数字或连字符；version 使用 SemVer。men
 
 ### 界面安装与启停
 
-进入「插件」→「从 URL 安装」，填写 HTTP/HTTPS tar.gz 直链和可选 SHA256。宿主最多跟随五次重定向，HTTPS 不降级为 HTTP；拒绝 URL 用户名/密码、回环、链路本地、未指定、多播等地址。每跳 DNS 解析后固定目标地址，避免重绑定绕过检查。允许局域网下载；没有下载域名白名单。请求不携带浏览器 Cookie、宿主凭据或代理环境变量。下载总时限 90 秒，压缩与解压大小有界，拒绝链接、设备文件和重复文件。安装成功后**默认停用**，不会执行插件。
+进入「插件」→「从 URL 安装」，填写 HTTP/HTTPS tar.gz 直链和可选 SHA256，可选择宿主已保存的下载代理。此选择只影响安装下载，不改变账号出站或插件业务代理。宿主最多跟随五次重定向，HTTPS 不降级为 HTTP；拒绝 URL 用户名/密码、回环、链路本地、未指定、多播等地址。每跳 DNS 解析后固定目标地址，避免重绑定绕过检查。允许局域网下载；没有下载域名白名单。请求不携带浏览器 Cookie 或宿主凭据，不自动读取代理环境变量。显式选择的代理 ID 由宿主 ProxyStore 解析，代理认证不返回浏览器、不写入插件注册表。直连时固定目标 DNS 地址；显式代理时 CONNECT / SOCKS 的最终目标解析由可信代理参与，不能把本地地址预检当作完整 SSRF 隔离。下载总时限 90 秒，压缩与解压大小有界，拒绝链接、设备文件和重复文件。安装成功后**默认停用**，不会执行插件。
 
 安装后点击「启用」，握手成功才显示运行中。停用会关闭新调用入口、等待当前有界调用结束并终止进程和回调入口，新请求不再执行该插件。业务页面里的“启用打标”只控制业务策略，和这里的进程开关不同。启动失败保持启用但不可用，可点击「重新启动」重试；请求扩展不会因为故障被静默跳过。卸载要求先停用，默认保留业务数据。
 
@@ -105,10 +105,10 @@ stdin/stdout 为 4 字节大端长度 + UTF-8 JSON，每帧最大 1 MiB。宿主
 | --- | --- |
 | GET /api/admin/plugins | 列表：id、version、enabled、available、menuLabel |
 | POST /api/admin/plugins/invoke | `{ "id":"example", "method":"admin.ui", "input":{} }`，返回插件结果 |
-| POST /api/admin/plugins/manage | `{ "action":"install", "url":"https://.../package.tar.gz", "sha256":"可选整包摘要" }` |
+| POST /api/admin/plugins/manage | `{ "action":"install", "url":"https://.../package.tar.gz", "sha256":"可选整包摘要", "proxyId":"可选的宿主代理ID" }` |
 | POST /api/admin/plugins/manage | `{ "action":"enable或disable或uninstall", "id":"example" }`；实际 action 分别为 enable、disable、uninstall |
 
-管理操作成功返回更新后的列表。安装失败、冲突与持久化失败返回固定分类文案，未知动作或字段返回宿主 JSON 校验错误（422）；不存在为 404，忙碌或进程故障为 503。前端安装等待预算 120 秒。网络断开不取消已接受的管理任务，应刷新确认最终状态后重试。控制面修改串行，第二个并发操作被拒绝；列表和业务请求不等待下载锁。
+管理操作成功返回更新后的列表。连接失败/超时、HTTP 状态、SHA256 不匹配、包格式、代理不可用与持久化失败返回不同文案，未知动作或字段返回宿主 JSON 校验错误（422）；不存在为 404，忙碌或进程故障为 503。前端安装等待预算 120 秒。网络断开不取消已接受的管理任务，应刷新确认最终状态后重试。控制面修改串行，第二个并发操作被拒绝；列表和业务请求不等待下载锁。
 
 ### 页面与侧栏
 
@@ -162,3 +162,10 @@ credentialScope 为 Provider 对账号及真实认证材料的不可逆摘要；
 回滚时停止宿主，恢复对应二进制及 Web、注册表和必要业务数据；保留 PostgreSQL 原迁移链。回到不认识 registry.json 的 plugin.1 时，需要手工把最终启停状态同步到旧 YAML，防止停用插件意外恢复。当前验证部署使用独立实例和克隆数据库；未切换原生产服务。
 
 实际证据、复现命令、未测场景及上游讨论问题见 [验证记录](plugins-validation.md)。
+
+
+## 对话测试插件
+
+`examples/plugins/chat` 是无需宿主业务能力授权的独立原生插件，版本 0.1.0。管理员在隔离页面输入 **RS Client API Key**，插件仅回连 `127.0.0.1:<端口>` 的 `/v1/models` 和 `/v1/responses`，端口默认 8080。它不会直接调用 Provider 探测接口，也不会取得 OAuth；正常 Key 鉴权、账号分组、路由、计量与 request.openai 扩展都会执行。
+
+页面支持模型列表/手动输入、多轮消息、SSE 回复轮询、停止与清空对话，显示 HTTP 状态、请求 ID、耗时和用量。客户端密钥与消息只留在页面和插件进程内存，不写插件文件；宿主正常请求日志/计量与管理员诊断配置仍适用。停止尽力取消 HTTP，不能撤回上游已执行的用量。尚未支持工具调用、附件、Markdown 富文本或 WebSocket。

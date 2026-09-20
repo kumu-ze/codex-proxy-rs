@@ -5,6 +5,7 @@ import { storeToRefs } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { invokePlugin, managePlugin } from '@/api/modules/plugins'
+import { getProxies } from '@/api/modules/proxies'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
@@ -12,6 +13,7 @@ import FormItem from '@/components/base/BaseForm/FormItem.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
+import BaseSelect from '@/components/base/BaseSelect.vue'
 import BaseTag from '@/components/base/BaseTag.vue'
 import { usePluginsStore } from '@/stores/modules/plugins'
 
@@ -25,6 +27,23 @@ const failure = ref('')
 const installOpen = ref(false)
 const downloadUrl = ref('')
 const checksum = ref('')
+const downloadProxy = ref('')
+const proxyOptions = ref<{ label: string, value: string }[]>([{ label: '直连（不使用代理）', value: '' }])
+watch(installOpen, async (opened) => {
+  if (!opened)
+    return
+  try {
+    const options = [{ label: '直连（不使用代理）', value: '' }]
+    for (let page = 1; page <= 20; page++) {
+      const result = await getProxies({ page, pageSize: 100, search: '' }, { silent: true })
+      options.push(...result.items.map(proxy => ({ label: proxy.name, value: proxy.id })))
+      if (page >= result.page.totalPages)
+        break
+    }
+    proxyOptions.value = options
+  }
+  catch { failure.value = '无法读取下载代理列表，可以直连重试。' }
+})
 const confirmOpen = ref(false)
 const target = ref<PluginStatus>()
 const action = ref<'enable' | 'disable' | 'uninstall'>('disable')
@@ -58,7 +77,7 @@ async function manage(operation: PluginManagement) {
   finally { busy.value = false }
 }
 function install() {
-  void manage({ action: 'install', url: downloadUrl.value.trim(), sha256: checksum.value.trim() || undefined })
+  void manage({ action: 'install', url: downloadUrl.value.trim(), sha256: checksum.value.trim() || undefined, proxyId: downloadProxy.value || undefined })
 }
 function confirm() {
   if (target.value)
@@ -214,6 +233,9 @@ watch(pageId, async (id) => {
       <form id="install-plugin" class="flex flex-col gap-4" @submit.prevent="install">
         <FormItem label="下载地址" control-id="plugin-url" required>
           <BaseInput id="plugin-url" v-model="downloadUrl" type="url" required placeholder="https://example.com/plugin-linux-x64.tar.gz" :disabled="busy" />
+        </FormItem>
+        <FormItem label="下载代理" control-id="plugin-proxy" description="仅用于下载插件包，不改变账号或打标插件的代理设置。">
+          <BaseSelect id="plugin-proxy" v-model="downloadProxy" :options="proxyOptions" :disabled="busy" />
         </FormItem>
         <FormItem label="SHA256（可选）" control-id="plugin-sha">
           <BaseInput id="plugin-sha" v-model="checksum" pattern="[a-fA-F0-9]{64}" placeholder="发布者提供的文件校验值" :disabled="busy" />

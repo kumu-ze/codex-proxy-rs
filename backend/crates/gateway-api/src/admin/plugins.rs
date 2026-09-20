@@ -63,9 +63,24 @@ fn operation_error(error: PluginOperationError) -> AdminError {
         PluginOperationError::Invalid => AdminError::bad_request("插件操作无效"),
         PluginOperationError::Rejected => AdminError::bad_request("插件拒绝了本次操作"),
         PluginOperationError::Unavailable => AdminError::service_unavailable(),
-        PluginOperationError::Package => AdminError::bad_request(
-            "下载或校验失败：请提供可直接下载的 tar.gz 插件包，检查地址、SHA256 和包格式",
-        ),
+        PluginOperationError::Package => {
+            AdminError::bad_request("插件包格式或内容校验失败：请提供兼容 API 1 的 tar.gz 插件包")
+        }
+        PluginOperationError::Download => {
+            AdminError::bad_request("下载连接失败：请检查网络或选择可用的下载代理")
+        }
+        PluginOperationError::DownloadTimeout => {
+            AdminError::bad_request("下载连接超时：请重试或选择下载代理")
+        }
+        PluginOperationError::DownloadHttp(status) => AdminError::bad_request(format!(
+            "下载服务器返回 HTTP {status}，请检查直链或下载代理"
+        )),
+        PluginOperationError::Checksum => {
+            AdminError::bad_request("SHA256 不匹配：请核对发布者提供的整包校验值")
+        }
+        PluginOperationError::Proxy => {
+            AdminError::bad_request("下载代理不存在或不可用，请重新选择")
+        }
         PluginOperationError::Conflict => {
             AdminError::bad_request("该插件已安装，或插件数量已达到 16 个上限")
         }

@@ -24,7 +24,7 @@ export function invokePlugin(id: string, method: string, input: unknown) {
   })
 }
 
-export type PluginManagement = { action: 'install', url: string, sha256?: string } | { action: 'enable' | 'disable' | 'uninstall', id: string }
+export type PluginManagement = { action: 'install', url: string, sha256?: string, proxyId?: string } | { action: 'enable' | 'disable' | 'uninstall', id: string }
 
 export function managePlugin(operation: PluginManagement) {
   return request<PluginStatus[]>({

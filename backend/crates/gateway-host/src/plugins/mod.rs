@@ -17,6 +17,14 @@ pub use registry::{PluginConfig, PluginRegistry};
 pub enum PluginError {
     #[error("invalid plugin package")]
     InvalidPackage,
+    #[error("plugin download failed")]
+    Download,
+    #[error("plugin download timed out")]
+    DownloadTimeout,
+    #[error("plugin download HTTP {0}")]
+    DownloadHttp(u16),
+    #[error("plugin checksum mismatch")]
+    Checksum,
     #[error("incompatible plugin API")]
     Incompatible,
     #[error("plugin I/O failed")]

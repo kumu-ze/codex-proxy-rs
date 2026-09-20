@@ -251,13 +251,42 @@ impl PluginRegistry {
             .ok_or(PluginOperationError::Unavailable)?;
         let mut entries = self.snapshot().await;
         match operation {
-            PluginManagement::Install { url, sha256 } => {
+            PluginManagement::Install {
+                url,
+                sha256,
+                proxy_id,
+            } => {
                 if entries.len() >= 16 {
                     return Err(PluginOperationError::Conflict);
                 }
-                let staged = super::management::download(catalog, &url, sha256.as_deref())
-                    .await
-                    .map_err(|_| PluginOperationError::Package)?;
+                let proxy = if let Some(id) = proxy_id {
+                    let services = self.services.get().ok_or(PluginOperationError::Proxy)?;
+                    let value = services
+                        .invoke("proxies.resolve", serde_json::json!({"id":id}))
+                        .await
+                        .map_err(|_| PluginOperationError::Proxy)?;
+                    Some(
+                        value
+                            .as_str()
+                            .ok_or(PluginOperationError::Proxy)?
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                let staged =
+                    super::management::download(catalog, &url, sha256.as_deref(), proxy.as_deref())
+                        .await
+                        .map_err(|error| match error {
+                            PluginError::Download => PluginOperationError::Download,
+                            PluginError::DownloadTimeout => PluginOperationError::DownloadTimeout,
+                            PluginError::DownloadHttp(status) => {
+                                PluginOperationError::DownloadHttp(status)
+                            }
+                            PluginError::Checksum => PluginOperationError::Checksum,
+                            PluginError::Io => PluginOperationError::Storage,
+                            _ => PluginOperationError::Package,
+                        })?;
                 let package =
                     PluginPackage::open(&staged.path).map_err(|_| PluginOperationError::Package)?;
                 let id = package.manifest().id.clone();

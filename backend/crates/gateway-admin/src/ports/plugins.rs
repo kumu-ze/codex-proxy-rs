@@ -17,10 +17,21 @@ pub struct PluginStatus {
 #[derive(Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
 pub enum PluginManagement {
-    Install { url: String, sha256: Option<String> },
-    Enable { id: String },
-    Disable { id: String },
-    Uninstall { id: String },
+    Install {
+        url: String,
+        sha256: Option<String>,
+        #[serde(rename = "proxyId")]
+        proxy_id: Option<String>,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Uninstall {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -35,6 +46,16 @@ pub enum PluginOperationError {
     Unavailable,
     #[error("plugin package download or validation failed")]
     Package,
+    #[error("plugin download failed")]
+    Download,
+    #[error("plugin download timed out")]
+    DownloadTimeout,
+    #[error("plugin download HTTP {0}")]
+    DownloadHttp(u16),
+    #[error("plugin checksum mismatch")]
+    Checksum,
+    #[error("download proxy unavailable")]
+    Proxy,
     #[error("plugin already installed or limit reached")]
     Conflict,
     #[error("plugin state could not be saved")]

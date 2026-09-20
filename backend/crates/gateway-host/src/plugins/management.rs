@@ -87,6 +87,7 @@ pub(super) async fn download(
     catalog: &Catalog,
     url: &str,
     sha256: Option<&str>,
+    proxy: Option<&str>,
 ) -> Result<StagedPackage, PluginError> {
     if url.len() > 8192
         || sha256.is_some_and(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -108,7 +109,7 @@ pub(super) async fn download(
                 .ok_or(PluginError::InvalidPackage)?;
             let addresses: Vec<_> = tokio::net::lookup_host((host.trim_matches(['[', ']']), port))
                 .await
-                .map_err(|_| PluginError::Io)?
+                .map_err(|_| PluginError::Download)?
                 .collect();
             // 地址解析后固定连接目标，防止重定向或 DNS 变化访问回环回调与云元数据。
             if addresses.is_empty()
@@ -131,19 +132,25 @@ pub(super) async fn download(
             {
                 return Err(PluginError::InvalidPackage);
             }
-            let client = reqwest::Client::builder()
+            let mut builder = reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .resolve_to_addrs(host, &addresses)
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(90))
-                .build()
-                .map_err(|_| PluginError::Io)?;
-            let response = client
-                .get(url.clone())
-                .send()
-                .await
-                .map_err(|_| PluginError::Io)?;
+                .user_agent("CodexProxyRS-PluginInstaller/1");
+            if let Some(proxy) = proxy {
+                builder =
+                    builder.proxy(reqwest::Proxy::all(proxy).map_err(|_| PluginError::Download)?);
+            }
+            let client = builder.build().map_err(|_| PluginError::Download)?;
+            let response = client.get(url.clone()).send().await.map_err(|error| {
+                if error.is_timeout() {
+                    PluginError::DownloadTimeout
+                } else {
+                    PluginError::Download
+                }
+            })?;
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -159,17 +166,25 @@ pub(super) async fn download(
                 url = next;
                 continue;
             }
-            if !response.status().is_success()
-                || response
-                    .content_length()
-                    .is_some_and(|size| size > MAX_BYTES as u64)
+            if !response.status().is_success() {
+                return Err(PluginError::DownloadHttp(response.status().as_u16()));
+            }
+            if response
+                .content_length()
+                .is_some_and(|size| size > MAX_BYTES as u64)
             {
                 return Err(PluginError::InvalidPackage);
             }
             let mut body = Vec::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|_| PluginError::Io)?;
+                let chunk = chunk.map_err(|error| {
+                    if error.is_timeout() {
+                        PluginError::DownloadTimeout
+                    } else {
+                        PluginError::Download
+                    }
+                })?;
                 if body.len() + chunk.len() > MAX_BYTES {
                     return Err(PluginError::InvalidPackage);
                 }
@@ -180,9 +195,9 @@ pub(super) async fn download(
         Err(PluginError::InvalidPackage)
     })
     .await
-    .map_err(|_| PluginError::Timeout)??;
+    .map_err(|_| PluginError::DownloadTimeout)??;
     if sha256.is_some_and(|s| !hex::encode(Sha256::digest(&bytes)).eq_ignore_ascii_case(s)) {
-        return Err(PluginError::InvalidPackage);
+        return Err(PluginError::Checksum);
     }
     let path = catalog
         .root
